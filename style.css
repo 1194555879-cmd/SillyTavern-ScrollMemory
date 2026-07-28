@@ -104,9 +104,14 @@
 
 @media (max-width: 600px) {
     #ksm-panel {
-        top: max(8px, env(safe-area-inset-top));
+        /*
+         * TauriTavern themes often add a fixed decorative header below the
+         * iOS safe area. Leave enough room for both so the title and close
+         * button never sit behind that header.
+         */
+        top: max(76px, calc(env(safe-area-inset-top) + 48px));
         right: 8px;
         width: calc(100vw - 16px);
-        max-height: calc(100dvh - 16px - env(safe-area-inset-top));
+        max-height: calc(100dvh - 164px - env(safe-area-inset-bottom));
     }
 }
