@@ -250,7 +250,7 @@ function mountUi() {
         <button id="ksm-launcher" type="button" title="卷轴记忆">📜</button>
         <aside id="ksm-panel" aria-label="卷轴记忆">
             <header class="ksm-title">
-                <div><strong>Krystal · 卷轴记忆</strong><small>v0.1.0</small></div>
+                <div><strong>Krystal · 卷轴记忆</strong><small>v0.1.1</small></div>
                 <button data-action="close" title="关闭">×</button>
             </header>
             <nav class="ksm-tabs">
@@ -330,7 +330,7 @@ function init() {
     updateInjection();
     render();
     window.setTimeout(hideAllMemoryBlocks, 100);
-    console.info('[Krystal Scroll Memory] v0.1.0 loaded');
+    console.info('[Krystal Scroll Memory] v0.1.1 loaded');
 }
 
 if (document.readyState === 'loading') {
