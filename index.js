@@ -19,6 +19,33 @@ let panelOpen = false;
 let activeTab = 'short';
 let initialized = false;
 
+function applyViewportGuards() {
+    const panel = document.getElementById('ksm-panel');
+    const launcher = document.getElementById('ksm-launcher');
+    if (!panel || !launcher) return;
+
+    panel.style.setProperty('z-index', '2147483000', 'important');
+    launcher.style.setProperty('z-index', '2147482999', 'important');
+
+    const touchLayout = window.matchMedia('(hover: none) and (pointer: coarse)').matches
+        || window.innerWidth <= 1100;
+    if (touchLayout) {
+        panel.style.setProperty(
+            'top',
+            'max(76px, calc(env(safe-area-inset-top) + 48px))',
+            'important',
+        );
+        panel.style.setProperty(
+            'max-height',
+            'calc(100dvh - 164px - env(safe-area-inset-bottom))',
+            'important',
+        );
+    } else {
+        panel.style.removeProperty('top');
+        panel.style.removeProperty('max-height');
+    }
+}
+
 function emptyState() {
     return {
         version: 1,
@@ -248,9 +275,9 @@ function mountUi() {
     if (document.getElementById('ksm-launcher')) return;
     document.body.insertAdjacentHTML('beforeend', `
         <button id="ksm-launcher" type="button" title="卷轴记忆">📜</button>
-        <aside id="ksm-panel" aria-label="卷轴记忆">
+        <div id="ksm-panel" role="dialog" aria-label="卷轴记忆">
             <header class="ksm-title">
-                <div><strong>Krystal · 卷轴记忆</strong><small>v0.1.1</small></div>
+                <div><strong>Krystal · 卷轴记忆</strong><small>v0.1.2</small></div>
                 <button data-action="close" title="关闭">×</button>
             </header>
             <nav class="ksm-tabs">
@@ -263,8 +290,11 @@ function mountUi() {
                 <button data-action="export">导出</button>
                 <label>导入<input id="ksm-import" type="file" accept=".json,application/json"></label>
             </footer>
-        </aside>`);
+        </div>`);
 
+    applyViewportGuards();
+    window.addEventListener('resize', applyViewportGuards);
+    window.addEventListener('orientationchange', applyViewportGuards);
     document.getElementById('ksm-launcher').addEventListener('click', () => {
         panelOpen = !panelOpen;
         render();
@@ -330,7 +360,7 @@ function init() {
     updateInjection();
     render();
     window.setTimeout(hideAllMemoryBlocks, 100);
-    console.info('[Krystal Scroll Memory] v0.1.1 loaded');
+    console.info('[Krystal Scroll Memory] v0.1.2 loaded');
 }
 
 if (document.readyState === 'loading') {
