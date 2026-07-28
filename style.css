@@ -2,7 +2,7 @@
     position: fixed;
     right: max(14px, env(safe-area-inset-right));
     bottom: max(76px, calc(env(safe-area-inset-bottom) + 64px));
-    z-index: 3000;
+    z-index: 2147482999 !important;
     width: 46px;
     height: 46px;
     border: 1px solid var(--SmartThemeBorderColor);
@@ -18,7 +18,7 @@
     position: fixed;
     top: 8vh;
     right: max(12px, env(safe-area-inset-right));
-    z-index: 3001;
+    z-index: 2147483000 !important;
     display: none;
     flex-direction: column;
     width: min(430px, calc(100vw - 24px));
@@ -30,6 +30,7 @@
     color: var(--SmartThemeBodyColor);
     box-shadow: 0 14px 45px rgb(0 0 0 / 45%);
     backdrop-filter: blur(16px);
+    isolation: isolate;
 }
 
 #ksm-panel.ksm-open { display: flex; }
@@ -102,16 +103,16 @@
 }
 .ksm-footer input { display: none; }
 
-@media (max-width: 600px) {
+@media (max-width: 1100px), (hover: none) and (pointer: coarse) {
     #ksm-panel {
         /*
          * TauriTavern themes often add a fixed decorative header below the
          * iOS safe area. Leave enough room for both so the title and close
          * button never sit behind that header.
          */
-        top: max(76px, calc(env(safe-area-inset-top) + 48px));
+        top: max(76px, calc(env(safe-area-inset-top) + 48px)) !important;
         right: 8px;
         width: calc(100vw - 16px);
-        max-height: calc(100dvh - 164px - env(safe-area-inset-bottom));
+        max-height: calc(100dvh - 164px - env(safe-area-inset-bottom)) !important;
     }
 }
