@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.4';
+const VERSION = '0.3.5';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 4;
 const SOURCE_DIGEST_VERSION = 2;
@@ -1625,12 +1625,14 @@ function detachImportedTerminalMemory() {
     const baseline = data.baseline;
     const source = normalizeSource(baseline?.source);
     if (!baseline || baseline.terminalDetached || !source || !baseline.short.length) {
-        return { detached: false, needsCapture: false };
+        return { detached: false, needsCapture: false, replacedStaticTerminal: false };
     }
 
     const terminalIndex = source.chatMessages - 1;
     const message = ctx.chat[terminalIndex];
-    if (!message || message.is_user) return { detached: false, needsCapture: false };
+    if (!message || message.is_user) {
+        return { detached: false, needsCapture: false, replacedStaticTerminal: false };
+    }
 
     const digestVersion = source.digestVersion || 1;
     const selectedMatches = messageSnapshotDigest(message, digestVersion) === source.lastMessageDigest;
@@ -1639,8 +1641,17 @@ function detachImportedTerminalMemory() {
     const beforePrefixMatches = source.beforeLastPrefixDigest
         && chatPrefixDigest(ctx.chat.slice(0, terminalIndex), digestVersion) === source.beforeLastPrefixDigest;
     const originalSwipeId = findSwipeByDigest(message, source.lastMessageDigest, digestVersion);
-    if (!selectedMatches && !fullPrefixMatches && !beforePrefixMatches && originalSwipeId < 0) {
-        return { detached: false, needsCapture: false };
+    const currentStoredCapture = readStoredCapture(message);
+    const currentCaptureReplacesStaticTerminal = Boolean(
+        currentStoredCapture?.capturedAt
+        && currentStoredCapture.capturedAt >= baseline.importedAt,
+    );
+    if (!selectedMatches
+        && !fullPrefixMatches
+        && !beforePrefixMatches
+        && originalSwipeId < 0
+        && !currentCaptureReplacesStaticTerminal) {
+        return { detached: false, needsCapture: false, replacedStaticTerminal: false };
     }
 
     const terminalMemory = baseline.short.at(-1);
@@ -1660,7 +1671,15 @@ function detachImportedTerminalMemory() {
         })),
     };
 
-    if (selectedMatches || fullPrefixMatches) {
+    if (currentCaptureReplacesStaticTerminal) {
+        // Old archive files did not always include beforeLastPrefixDigest. A
+        // capture created after import on that exact terminal floor is the
+        // current selected swipe's replacement, so keep it in message.extra
+        // and remove the static terminal summary from the baseline.
+        if (originalSwipeId >= 0 && originalSwipeId !== Number(message.swipe_id)) {
+            writeStoredCaptureToSwipe(message, originalSwipeId, capture, '导入旧档末轮');
+        }
+    } else if (selectedMatches || fullPrefixMatches) {
         if (!readStoredCapture(message)) {
             writeStoredCapture(message, capture, '导入旧档末轮');
         }
@@ -1679,7 +1698,7 @@ function detachImportedTerminalMemory() {
     ctx.chatMetadata[META_KEY] = data;
     ctx.saveMetadataDebounced();
 
-    syncCaptureFromCurrentSwipe(message);
+    if (!currentCaptureReplacesStaticTerminal) syncCaptureFromCurrentSwipe(message);
     const needsCapture = !readStoredCapture(message);
     if (needsCapture) {
         runtimeStatus.captureState = 'warning';
@@ -1689,6 +1708,7 @@ function detachImportedTerminalMemory() {
         detached: true,
         needsCapture,
         messageIndex: terminalIndex,
+        replacedStaticTerminal: currentCaptureReplacesStaticTerminal,
     };
 }
 
@@ -1855,17 +1875,21 @@ function refreshCurrentChatState({ showStatus = false } = {}) {
     if (!ctx.chatId) return null;
     const before = state();
     const beforeShort = before.short.length;
-    detachImportedTerminalMemory();
+    const detached = detachImportedTerminalMemory();
     const rebuilt = rebuildFromChat();
     if (showStatus && runtimeStatus.captureState !== 'working') {
         const recovered = Math.max(0, rebuilt.short.length - beforeShort);
         const latestIndex = latestAssistantMessageIndex();
         const latestHasCapture = latestIndex >= 0
             && Boolean(readStoredCapture(ctx.chat[latestIndex]));
-        runtimeStatus.captureState = recovered > 0 ? 'success' : 'idle';
-        runtimeStatus.captureText = recovered > 0
-            ? `捕获：自动重建找回 ${recovered} 条短期记忆 · 当前 ${rebuilt.short.length}/${MAX_SHORT}`
-            : `捕获：已自动核对楼层底片 · 最后一轮${latestHasCapture ? '有' : '没有'}底片 · 当前短期 ${rebuilt.short.length}/${MAX_SHORT}`;
+        runtimeStatus.captureState = detached.replacedStaticTerminal || recovered > 0
+            ? 'success'
+            : 'idle';
+        runtimeStatus.captureText = detached.replacedStaticTerminal
+            ? `捕获：已移除重 roll 前的旧总结 · 当前短期 ${rebuilt.short.length}/${MAX_SHORT}`
+            : (recovered > 0
+                ? `捕获：自动重建找回 ${recovered} 条短期记忆 · 当前 ${rebuilt.short.length}/${MAX_SHORT}`
+                : `捕获：已自动核对楼层底片 · 最后一轮${latestHasCapture ? '有' : '没有'}底片 · 当前短期 ${rebuilt.short.length}/${MAX_SHORT}`);
         render();
     }
     return rebuilt;
