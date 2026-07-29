@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.5';
+const VERSION = '0.3.6';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 4;
 const SOURCE_DIGEST_VERSION = 2;
@@ -475,6 +475,8 @@ function normalizeSource(source) {
         ...source,
         digestVersion: Math.max(1, Number(source.digestVersion) || 1),
         chatMessages,
+        assistantTurns: Math.max(0, Number(source.assistantTurns) || 0),
+        userTurns: Math.max(0, Number(source.userTurns) || 0),
         throughMessageIndex: Number.isInteger(Number(source.throughMessageIndex))
             ? Number(source.throughMessageIndex)
             : chatMessages - 1,
@@ -1619,6 +1621,69 @@ function findSwipeByDigest(message, expectedDigest, digestVersion) {
     return -1;
 }
 
+function captureWasCreatedAfterImport(message, baseline) {
+    const stored = readStoredCapture(message);
+    return Boolean(
+        stored?.capturedAt
+        && stored.capturedAt >= Number(baseline?.importedAt || 0),
+    );
+}
+
+function resolveImportedTerminalIndex(baseline, chat) {
+    const source = normalizeSource(baseline?.source);
+    if (!source || !Array.isArray(chat) || !chat.length) return -1;
+
+    const digestVersion = source.digestVersion || 1;
+    const expectedIndex = source.chatMessages - 1;
+    if (source.lastMessageDigest) {
+        const digestMatches = [];
+        for (let index = 0; index < chat.length; index++) {
+            const message = chat[index];
+            if (!message || message.is_user) continue;
+            const selectedMatches = messageSnapshotDigest(message, digestVersion)
+                === source.lastMessageDigest;
+            const swipeMatches = findSwipeByDigest(
+                message,
+                source.lastMessageDigest,
+                digestVersion,
+            ) >= 0;
+            if (selectedMatches || swipeMatches) digestMatches.push(index);
+        }
+        if (digestMatches.length) {
+            digestMatches.sort(
+                (left, right) => Math.abs(left - expectedIndex) - Math.abs(right - expectedIndex),
+            );
+            return digestMatches[0];
+        }
+    }
+
+    // Archives exported before v0.3.0 do not have beforeLastPrefixDigest.
+    // Resolve their terminal floor by conversation turn counts instead of a
+    // brittle absolute array index. This survives Tauri migrations that move
+    // the same assistant floor while preserving the user/assistant sequence.
+    const targetAssistantTurns = source.assistantTurns;
+    const targetUserTurns = source.userTurns;
+    if (!targetAssistantTurns) return -1;
+
+    let assistantTurns = 0;
+    let userTurns = 0;
+    for (let index = 0; index < chat.length; index++) {
+        const message = chat[index];
+        if (!message) continue;
+        if (message.is_user) {
+            userTurns += 1;
+            continue;
+        }
+        assistantTurns += 1;
+        if (assistantTurns !== targetAssistantTurns) continue;
+        const userCountMatches = !targetUserTurns || userTurns === targetUserTurns;
+        return userCountMatches && captureWasCreatedAfterImport(message, baseline)
+            ? index
+            : -1;
+    }
+    return -1;
+}
+
 function detachImportedTerminalMemory() {
     const ctx = context();
     const data = state();
@@ -1628,9 +1693,9 @@ function detachImportedTerminalMemory() {
         return { detached: false, needsCapture: false, replacedStaticTerminal: false };
     }
 
-    const terminalIndex = source.chatMessages - 1;
+    const terminalIndex = resolveImportedTerminalIndex(baseline, ctx.chat);
     const message = ctx.chat[terminalIndex];
-    if (!message || message.is_user) {
+    if (terminalIndex < 0 || !message || message.is_user) {
         return { detached: false, needsCapture: false, replacedStaticTerminal: false };
     }
 
