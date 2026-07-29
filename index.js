@@ -2698,8 +2698,8 @@ function init() {
     initialized = true;
     mountUi();
     registerEvents();
-    const detached = detachImportedTerminalMemory();
-    if (detached.detached) rebuildFromChat();
+    detachImportedTerminalMemory();
+    if (context().chatId) rebuildFromChat();
     updateInjection();
     render();
     window.setTimeout(hideAllMemoryBlocks, 100);
