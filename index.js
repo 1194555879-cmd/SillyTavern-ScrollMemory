@@ -10,9 +10,9 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 const STATE_VERSION = 3;
-const SETTINGS_VERSION = 3;
+const SETTINGS_VERSION = 4;
 const SOURCE_DIGEST_VERSION = 2;
 const CUSTOM_SECRET_KEY = 'api_key_custom';
 const DIRECT_SECRET_LABEL = 'Krystal · 卷轴记忆专用 API';
@@ -40,6 +40,15 @@ const FACT_CATEGORIES = [
     '未解线索',
     '其他',
 ];
+const FACT_CATEGORY_META = {
+    人物与关系: { icon: 'fa-user-group', hint: '身份、关系与称呼' },
+    秘密与知情: { icon: 'fa-lock', hint: '秘密与人物知情边界' },
+    物品与地点: { icon: 'fa-location-dot', hint: '关键物品、归属与地点' },
+    承诺与日期: { icon: 'fa-calendar-check', hint: '约定、期限与重要日期' },
+    身体与习惯: { icon: 'fa-heart-pulse', hint: '伤病、身体状态与习惯' },
+    未解线索: { icon: 'fa-magnifying-glass', hint: '伏笔、疑问与待处理事项' },
+    其他: { icon: 'fa-folder', hint: '暂未归入以上类别的事实' },
+};
 const BAD_PATTERNS = [
     '重要系统任务',
     '记忆卷轴归档',
@@ -74,6 +83,7 @@ let trackRawStream = false;
 let rawStreamText = '';
 let captureQueue = Promise.resolve();
 let factBootstrapRunning = false;
+const openFactCategories = new Set();
 const runtimeStatus = {
     injectionState: 'idle',
     injectionText: '注入：等待选择聊天',
@@ -87,6 +97,7 @@ const runtimeStatus = {
 };
 const DEFAULT_SETTINGS = {
     settingsVersion: SETTINGS_VERSION,
+    appearance: 'follow',
     captureMode: 'direct',
     connectionProfileId: '',
     directApiUrl: '',
@@ -292,6 +303,9 @@ function pluginSettings() {
     if (previousSettingsVersion < SETTINGS_VERSION) {
         settings.settingsVersion = SETTINGS_VERSION;
     }
+    settings.appearance = ['follow', 'light', 'dark'].includes(settings.appearance)
+        ? settings.appearance
+        : DEFAULT_SETTINGS.appearance;
     settings.captureMode = ['direct', 'profile', 'inline'].includes(settings.captureMode)
         ? settings.captureMode
         : DEFAULT_SETTINGS.captureMode;
@@ -1760,6 +1774,7 @@ function escapeHtml(value) {
 function renderSettings(panel) {
     const settings = pluginSettings();
     const profiles = settings.captureMode === 'profile' ? supportedProfiles() : [];
+    const appearance = panel.querySelector('#ksm-appearance');
     const mode = panel.querySelector('#ksm-capture-mode');
     const directSettings = panel.querySelector('#ksm-direct-settings');
     const profileSettings = panel.querySelector('#ksm-profile-settings');
@@ -1779,6 +1794,7 @@ function renderSettings(panel) {
         && settings.directSecretId,
     );
 
+    appearance.value = settings.appearance;
     mode.value = settings.captureMode;
     directSettings.hidden = settings.captureMode !== 'direct';
     profileSettings.hidden = settings.captureMode !== 'profile';
@@ -1846,9 +1862,81 @@ async function copyInjectionPreview() {
     toastr.success('已复制本轮实际登记的记忆提示词');
 }
 
+function applyAppearance(panel) {
+    const appearance = pluginSettings().appearance;
+    panel.dataset.appearance = appearance;
+    const launcher = document.getElementById('ksm-launcher');
+    if (launcher) launcher.dataset.appearance = appearance;
+}
+
+function renderEditableItem(item, kind, data) {
+    const label = kind === 'facts'
+        ? item.key
+        : (kind === 'long'
+            ? (item.label || '长期记忆')
+            : (item.label || `短期记忆 ${data.short.indexOf(item) + 1}`));
+    const icon = kind === 'facts'
+        ? 'fa-bookmark'
+        : (kind === 'long' ? 'fa-book-open' : 'fa-feather-pointed');
+    return `
+        <article class="ksm-item ksm-item-${kind}" data-id="${escapeHtml(item.id)}">
+            <header class="ksm-item-header">
+                <span class="ksm-item-title">
+                    <span class="ksm-item-mark" aria-hidden="true"><i class="fa-solid ${icon}"></i></span>
+                    <span class="ksm-item-label">${escapeHtml(label)}</span>
+                </span>
+                <span class="ksm-item-actions">
+                    <button data-action="save-item" title="保存这条记忆" aria-label="保存这条记忆">
+                        <i class="fa-solid fa-check" aria-hidden="true"></i>
+                    </button>
+                    <button data-action="delete-item" title="删除这条记忆" aria-label="删除这条记忆">
+                        <i class="fa-solid fa-trash-can" aria-hidden="true"></i>
+                    </button>
+                </span>
+            </header>
+            <textarea aria-label="${escapeHtml(label)}">${escapeHtml(item.content)}</textarea>
+        </article>`;
+}
+
+function renderFactGroups(items, data) {
+    return FACT_CATEGORIES
+        .map(category => ({
+            category,
+            items: items.filter(item => item.category === category),
+            meta: FACT_CATEGORY_META[category] || FACT_CATEGORY_META.其他,
+        }))
+        .filter(group => group.items.length)
+        .map(group => {
+            const expanded = openFactCategories.has(group.category);
+            return `
+                <section class="ksm-fact-group${expanded ? ' is-open' : ''}" data-category="${escapeHtml(group.category)}">
+                    <button class="ksm-fact-group-head" data-action="toggle-fact-group" aria-expanded="${expanded}">
+                        <span class="ksm-fact-group-icon" aria-hidden="true">
+                            <i class="fa-solid ${group.meta.icon}"></i>
+                        </span>
+                        <span class="ksm-fact-group-copy">
+                            <strong>${escapeHtml(group.category)}</strong>
+                            <small>${escapeHtml(group.meta.hint)}</small>
+                        </span>
+                        <span class="ksm-fact-group-count">${group.items.length}</span>
+                        <i class="fa-solid fa-chevron-down ksm-fact-group-caret" aria-hidden="true"></i>
+                    </button>
+                    <div class="ksm-fact-group-body">
+                        <div class="ksm-fact-group-inner">
+                            <div class="ksm-fact-items">
+                                ${group.items.map(item => renderEditableItem(item, 'facts', data)).join('')}
+                            </div>
+                        </div>
+                    </div>
+                </section>`;
+        })
+        .join('');
+}
+
 function render() {
     const panel = document.getElementById('ksm-panel');
     if (!panel) return;
+    applyAppearance(panel);
     const data = state();
     panel.classList.toggle('ksm-open', panelOpen);
     panel.classList.toggle('ksm-settings-open', settingsOpen);
@@ -1882,24 +1970,9 @@ function render() {
         ? data.short
         : (activeTab === 'long' ? data.long : data.facts);
     panel.querySelector('#ksm-list').innerHTML = items.length
-        ? items.map(item => `
-            <article class="ksm-item ksm-item-${activeTab}" data-id="${escapeHtml(item.id)}">
-                <header>
-                    <span class="ksm-item-mark" aria-hidden="true">
-                        <i class="fa-solid ${activeTab === 'facts' ? 'fa-bookmark' : (activeTab === 'long' ? 'fa-book-open' : 'fa-feather-pointed')}"></i>
-                    </span>
-                    <span>${escapeHtml(
-                        activeTab === 'facts'
-                            ? `${item.category} · ${item.key}`
-                            : (item.label || `短期记忆 ${data.short.indexOf(item) + 1}`),
-                    )}</span>
-                </header>
-                <textarea>${escapeHtml(item.content)}</textarea>
-                <div class="ksm-item-actions">
-                    <button data-action="save-item"><i class="fa-solid fa-check"></i><span>保存</span></button>
-                    <button data-action="delete-item"><i class="fa-solid fa-trash-can"></i><span>删除</span></button>
-                </div>
-            </article>`).join('')
+        ? (activeTab === 'facts'
+            ? renderFactGroups(items, data)
+            : items.map(item => renderEditableItem(item, activeTab, data)).join(''))
         : (activeTab === 'facts'
             ? `<div class="ksm-empty">
                     <span class="ksm-empty-icon"><i class="fa-solid fa-wand-magic-sparkles"></i></span>
@@ -2142,8 +2215,19 @@ function mountUi() {
             <section id="ksm-settings" aria-label="记忆 API 设置">
                 <div class="ksm-section-heading">
                     <span class="ksm-section-icon"><i class="fa-solid fa-sliders"></i></span>
-                    <span><h3>记忆生成方式</h3><small>连接、模型与总结指令</small></span>
+                    <span><h3>卷轴记忆设置</h3><small>外观、连接、模型与总结指令</small></span>
                 </div>
+                <label class="ksm-setting-row">
+                    <span>面板外观</span>
+                    <select id="ksm-appearance">
+                        <option value="follow">跟随酒馆</option>
+                        <option value="light">日间模式</option>
+                        <option value="dark">夜间模式</option>
+                    </select>
+                </label>
+                <p class="ksm-setting-help">
+                    “跟随酒馆”会读取当前美化配色；也可以只让卷轴面板固定为日间或夜间。
+                </p>
                 <label class="ksm-setting-row">
                     <span>工作模式</span>
                     <select id="ksm-capture-mode">
@@ -2230,8 +2314,9 @@ function mountUi() {
                     <button data-action="view-injection"><i class="fa-solid fa-eye"></i><span>查看注入</span></button>
                     <button data-action="rebuild"><i class="fa-solid fa-arrows-rotate"></i><span>重建</span></button>
                     <button data-action="export"><i class="fa-solid fa-upload"></i><span>导出</span></button>
-                    <label><i class="fa-solid fa-download"></i><span>导入</span><input id="ksm-import" type="file" accept=".json,application/json"></label>
+                    <button data-action="import"><i class="fa-solid fa-download"></i><span>导入</span></button>
                 </div>
+                <input id="ksm-import" type="file" accept=".json,application/json">
             </footer>
         </div>`);
 
@@ -2262,6 +2347,19 @@ function mountUi() {
         if (action === 'close-injection') injectionPreviewOpen = false;
         if (action === 'copy-injection') void copyInjectionPreview();
         if (action === 'export') downloadJson();
+        if (action === 'import') document.getElementById('ksm-import')?.click();
+        if (action === 'toggle-fact-group') {
+            const category = button.closest('.ksm-fact-group')?.dataset.category;
+            if (category) {
+                if (openFactCategories.has(category)) {
+                    openFactCategories.delete(category);
+                } else {
+                    openFactCategories.add(category);
+                }
+            }
+            render();
+            return;
+        }
         if (action === 'save-settings') {
             runtimeStatus.captureState = 'working';
             runtimeStatus.captureText = '捕获：正在保存设置';
@@ -2317,6 +2415,12 @@ function mountUi() {
     });
     document.getElementById('ksm-panel').addEventListener('change', event => {
         const settings = pluginSettings();
+        if (event.target.id === 'ksm-appearance') {
+            settings.appearance = ['follow', 'light', 'dark'].includes(event.target.value)
+                ? event.target.value
+                : 'follow';
+            savePluginSettings();
+        }
         if (event.target.id === 'ksm-capture-mode') {
             settings.captureMode = ['direct', 'profile', 'inline'].includes(event.target.value)
                 ? event.target.value
