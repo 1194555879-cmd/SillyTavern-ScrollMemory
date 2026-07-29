@@ -12,6 +12,16 @@
     box-shadow: 0 5px 18px rgb(0 0 0 / 35%);
     font-size: 24px;
     cursor: pointer;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    will-change: left, top, transform;
+}
+
+#ksm-launcher.ksm-dragging {
+    cursor: grabbing;
+    transform: scale(1.08);
+    opacity: .9;
 }
 
 #ksm-panel {
@@ -136,6 +146,10 @@
 .ksm-footer input { display: none; }
 
 @media (max-width: 1100px), (hover: none) and (pointer: coarse) {
+    #ksm-launcher {
+        bottom: max(160px, calc(env(safe-area-inset-bottom) + 136px));
+    }
+
     #ksm-panel {
         /*
          * TauriTavern themes often add a fixed decorative header below the
