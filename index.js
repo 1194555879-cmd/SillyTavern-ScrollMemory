@@ -2,6 +2,7 @@ import { getContext } from '../../../extensions.js';
 import {
     extension_prompt_roles,
     extension_prompt_types,
+    getRequestHeaders,
 } from '../../../../script.js';
 
 const MODULE = 'krystal_scroll_memory';
@@ -9,7 +10,10 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
+const SETTINGS_VERSION = 2;
+const CUSTOM_SECRET_KEY = 'api_key_custom';
+const DIRECT_SECRET_LABEL = 'Krystal · 卷轴记忆专用 API';
 const MAX_SHORT = 20;
 const MAX_LONG = 30;
 const DEFAULT_MAX_TOKENS = 900;
@@ -42,8 +46,12 @@ const runtimeStatus = {
     captureText: '捕获：还没测试',
 };
 const DEFAULT_SETTINGS = {
-    captureMode: 'inline',
+    settingsVersion: SETTINGS_VERSION,
+    captureMode: 'direct',
     connectionProfileId: '',
+    directApiUrl: '',
+    directModel: '',
+    directSecretId: '',
     maxTokens: DEFAULT_MAX_TOKENS,
 };
 
@@ -226,8 +234,22 @@ function pluginSettings() {
         root[SETTINGS_KEY] = structuredClone(DEFAULT_SETTINGS);
     }
     const settings = root[SETTINGS_KEY];
-    settings.captureMode = settings.captureMode === 'profile' ? 'profile' : 'inline';
+    const previousSettingsVersion = Number(settings.settingsVersion) || 0;
+    if (previousSettingsVersion < SETTINGS_VERSION) {
+        // v0.2.0 only exposed Connection Profiles. If no profile was selected,
+        // migrate the empty screen to the new direct-entry mode automatically.
+        if (settings.captureMode === 'profile' && !settings.connectionProfileId) {
+            settings.captureMode = 'direct';
+        }
+        settings.settingsVersion = SETTINGS_VERSION;
+    }
+    settings.captureMode = ['direct', 'profile', 'inline'].includes(settings.captureMode)
+        ? settings.captureMode
+        : DEFAULT_SETTINGS.captureMode;
     settings.connectionProfileId = String(settings.connectionProfileId || '');
+    settings.directApiUrl = String(settings.directApiUrl || '');
+    settings.directModel = String(settings.directModel || '');
+    settings.directSecretId = String(settings.directSecretId || '');
     settings.maxTokens = clamp(
         Number(settings.maxTokens) || DEFAULT_MAX_TOKENS,
         MIN_MAX_TOKENS,
@@ -236,8 +258,12 @@ function pluginSettings() {
     return settings;
 }
 
-function isProfileMode() {
-    return pluginSettings().captureMode === 'profile';
+function isDirectMode() {
+    return pluginSettings().captureMode === 'direct';
+}
+
+function isDedicatedMode() {
+    return pluginSettings().captureMode !== 'inline';
 }
 
 function savePluginSettings() {
@@ -367,7 +393,7 @@ ${long || '无'}
 ${short || '无'}
 【历史记忆-结束】`;
 
-    if (isProfileMode()) {
+    if (isDedicatedMode()) {
         return `【卷轴记忆插件：隐藏指令开始】
 ${history}
 【卷轴记忆插件：隐藏指令结束】`;
@@ -408,7 +434,7 @@ function updateInjection() {
             runtimeStatus.injectionText = '注入：等待选择聊天';
         } else if (registered?.value === payload) {
             runtimeStatus.injectionState = 'success';
-            runtimeStatus.injectionText = isProfileMode()
+            runtimeStatus.injectionText = isDedicatedMode()
                 ? `注入：已装载历史记忆 · 独立 API 模式 · ${payload.length} 字`
                 : `注入：已装载 · user 层 · ${payload.length} 字`;
         } else {
@@ -551,6 +577,191 @@ function captureFromApiResponse(text) {
     }
 }
 
+function normalizeDirectApiUrl(value) {
+    const normalized = String(value || '')
+        .trim()
+        .replace(/\/+$/g, '')
+        .replace(/\/chat\/completions$/i, '');
+    if (!normalized) throw new Error('请输入 API 地址');
+    let parsed;
+    try {
+        parsed = new URL(normalized);
+    } catch {
+        throw new Error('API 地址格式不正确');
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('API 地址必须以 http:// 或 https:// 开头');
+    }
+    return normalized;
+}
+
+async function secretRequest(path, body) {
+    const response = await fetch(path, {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(detail || `酒馆密钥存储返回 ${response.status}`);
+    }
+    if (response.status === 204) return null;
+    return response.json();
+}
+
+async function storeDirectSecret(value, previousPluginSecretId) {
+    const state = await secretRequest('/api/secrets/read', {});
+    const currentSecrets = Array.isArray(state?.[CUSTOM_SECRET_KEY])
+        ? state[CUSTOM_SECRET_KEY]
+        : [];
+    const previousActiveId = currentSecrets.find(secret => secret.active)?.id || '';
+    const written = await secretRequest('/api/secrets/write', {
+        key: CUSTOM_SECRET_KEY,
+        value,
+        label: DIRECT_SECRET_LABEL,
+    });
+    const newSecretId = String(written?.id || '');
+    if (!newSecretId) throw new Error('酒馆没有返回密钥编号');
+
+    // Adding a custom key makes it the globally active custom key. Restore the
+    // user's previous main-chat key while this extension keeps using its own
+    // explicit secret_id.
+    if (previousActiveId
+        && previousActiveId !== previousPluginSecretId
+        && previousActiveId !== newSecretId) {
+        try {
+            await secretRequest('/api/secrets/rotate', {
+                key: CUSTOM_SECRET_KEY,
+                id: previousActiveId,
+            });
+        } catch (error) {
+            await secretRequest('/api/secrets/delete', {
+                key: CUSTOM_SECRET_KEY,
+                id: newSecretId,
+            }).catch(() => null);
+            throw new Error(`无法恢复正文 API 的原密钥：${error.message}`);
+        }
+    }
+
+    if (previousPluginSecretId && previousPluginSecretId !== newSecretId) {
+        await secretRequest('/api/secrets/delete', {
+            key: CUSTOM_SECRET_KEY,
+            id: previousPluginSecretId,
+        }).catch(error => {
+            console.warn('[Krystal Scroll Memory] Failed to remove the old memory API key', error);
+        });
+    }
+    return newSecretId;
+}
+
+function directFormValues() {
+    const panel = document.getElementById('ksm-panel');
+    return {
+        apiUrl: panel?.querySelector('#ksm-direct-api-url')?.value || '',
+        apiKey: panel?.querySelector('#ksm-direct-api-key')?.value || '',
+        model: panel?.querySelector('#ksm-direct-model')?.value || '',
+        maxTokens: panel?.querySelector('#ksm-max-tokens')?.value || DEFAULT_MAX_TOKENS,
+    };
+}
+
+async function saveDirectConfiguration({ notify = true } = {}) {
+    const settings = pluginSettings();
+    const form = directFormValues();
+    const apiUrl = normalizeDirectApiUrl(form.apiUrl);
+    const model = String(form.model || '').trim();
+    if (!model) throw new Error('请输入模型名称');
+    if (!form.apiKey.trim() && !settings.directSecretId) {
+        throw new Error('请输入 API 密钥');
+    }
+
+    let secretId = settings.directSecretId;
+    if (form.apiKey.trim()) {
+        secretId = await storeDirectSecret(form.apiKey.trim(), settings.directSecretId);
+    }
+
+    settings.captureMode = 'direct';
+    settings.directApiUrl = apiUrl;
+    settings.directModel = model;
+    settings.directSecretId = secretId;
+    settings.maxTokens = clamp(
+        Number(form.maxTokens) || DEFAULT_MAX_TOKENS,
+        MIN_MAX_TOKENS,
+        MAX_MAX_TOKENS,
+    );
+    context().saveSettingsDebounced();
+    const keyInput = document.getElementById('ksm-direct-api-key');
+    if (keyInput) keyInput.value = '';
+    [
+        document.getElementById('ksm-direct-api-url'),
+        document.getElementById('ksm-direct-api-key'),
+        document.getElementById('ksm-direct-model'),
+        document.getElementById('ksm-max-tokens'),
+    ].filter(Boolean).forEach(input => delete input.dataset.dirty);
+    runtimeStatus.captureState = 'idle';
+    runtimeStatus.captureText = '捕获：独立 API 配置已保存，请测试连接';
+    updateInjection();
+    render();
+    if (notify) toastr.success('记忆 API 配置已安全保存');
+    return settings;
+}
+
+function directResponseText(data) {
+    const content = data?.choices?.[0]?.message?.content
+        ?? data?.choices?.[0]?.text
+        ?? data?.output_text
+        ?? data?.content
+        ?? '';
+    if (Array.isArray(content)) {
+        return content
+            .map(part => typeof part === 'string' ? part : (part?.text ?? part?.content ?? ''))
+            .join('');
+    }
+    return String(content || '');
+}
+
+async function sendDirectRequest(messages, maxTokens = pluginSettings().maxTokens) {
+    const settings = pluginSettings();
+    const apiUrl = normalizeDirectApiUrl(settings.directApiUrl);
+    if (!settings.directModel) throw new Error('请先填写模型名称并保存');
+    if (!settings.directSecretId) throw new Error('请先填写 API 密钥并保存');
+
+    const response = await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        cache: 'no-cache',
+        body: JSON.stringify({
+            stream: false,
+            messages,
+            model: settings.directModel,
+            chat_completion_source: 'custom',
+            custom_url: apiUrl,
+            secret_id: settings.directSecretId,
+            max_tokens: maxTokens,
+            temperature: 0.2,
+            use_sysprompt: true,
+        }),
+    });
+    const raw = await response.text();
+    let data;
+    try {
+        data = JSON.parse(raw);
+    } catch {
+        throw new Error(raw || `记忆 API 返回了无法解析的内容（${response.status}）`);
+    }
+    if (!response.ok || data?.error) {
+        const message = data?.error?.message
+            ?? data?.message
+            ?? `请求失败（${response.status}）`;
+        throw new Error(String(message));
+    }
+    const text = directResponseText(data);
+    if (!text.trim()) throw new Error('记忆 API 返回了空内容');
+    return {
+        label: settings.directModel,
+        text,
+    };
+}
+
 async function sendProfileRequest(messages, maxTokens = pluginSettings().maxTokens) {
     const profile = selectedProfile();
     if (!profile) throw new Error('请先选择一个可用的记忆 API 连接配置');
@@ -571,7 +782,12 @@ async function sendProfileRequest(messages, maxTokens = pluginSettings().maxToke
         ? response
         : response?.content ?? response?.text ?? '';
     if (!String(text).trim()) throw new Error('记忆 API 返回了空内容');
-    return { profile, text: String(text) };
+    return { label: profile.name, text: String(text) };
+}
+
+async function sendDedicatedRequest(messages, maxTokens = pluginSettings().maxTokens) {
+    if (isDirectMode()) return sendDirectRequest(messages, maxTokens);
+    return sendProfileRequest(messages, maxTokens);
 }
 
 async function captureMessageWithProfile(messageIndex, snapshot) {
@@ -590,7 +806,7 @@ async function captureMessageWithProfile(messageIndex, snapshot) {
 
     try {
         const request = buildProfileCaptureRequest(messageIndex);
-        const { profile, text } = await sendProfileRequest(request.messages);
+        const { label, text } = await sendDedicatedRequest(request.messages);
         const latest = context();
         const latestMessage = latest.chat[messageIndex];
         if (latest.chatId !== snapshot.chatId
@@ -609,11 +825,11 @@ async function captureMessageWithProfile(messageIndex, snapshot) {
             throw new Error('短期记忆已满，但记忆 API 没有返回长期归档标签');
         }
 
-        writeStoredCapture(latestMessage, capture, `独立 API · ${profile.name}`);
+        writeStoredCapture(latestMessage, capture, `独立 API · ${label}`);
         rebuildFromChat();
         await latest.saveChat();
         runtimeStatus.captureState = 'success';
-        runtimeStatus.captureText = `捕获：成功 · 独立 API（${profile.name}）· 短期 ${capture.short.length} / 长期 ${capture.long.length}`;
+        runtimeStatus.captureText = `捕获：成功 · 独立 API（${label}）· 短期 ${capture.short.length} / 长期 ${capture.long.length}`;
         render();
         return true;
     } catch (error) {
@@ -642,17 +858,20 @@ function queueProfileCapture(messageIndex) {
 }
 
 async function testProfileConnection() {
-    runtimeStatus.captureState = 'working';
-    runtimeStatus.captureText = '捕获：正在测试独立 API';
-    render();
     try {
-        const { profile } = await sendProfileRequest([
+        if (isDirectMode()) {
+            await saveDirectConfiguration({ notify: false });
+        }
+        runtimeStatus.captureState = 'working';
+        runtimeStatus.captureText = '捕获：正在测试独立 API';
+        render();
+        const { label } = await sendDedicatedRequest([
             { role: 'system', content: '这是连接测试。' },
             { role: 'user', content: '只回复“连接成功”。' },
         ], 32);
         runtimeStatus.captureState = 'success';
-        runtimeStatus.captureText = `捕获：独立 API 已就绪 · ${profile.name}`;
-        toastr.success(`记忆 API 连接成功：${profile.name}`);
+        runtimeStatus.captureText = `捕获：独立 API 已就绪 · ${label}`;
+        toastr.success(`记忆 API 连接成功：${label}`);
     } catch (error) {
         runtimeStatus.captureState = 'error';
         runtimeStatus.captureText = `捕获：连接测试失败 · ${error.message}`;
@@ -796,14 +1015,36 @@ function escapeHtml(value) {
 
 function renderSettings(panel) {
     const settings = pluginSettings();
-    const profiles = supportedProfiles();
+    const profiles = settings.captureMode === 'profile' ? supportedProfiles() : [];
     const mode = panel.querySelector('#ksm-capture-mode');
+    const directSettings = panel.querySelector('#ksm-direct-settings');
+    const profileSettings = panel.querySelector('#ksm-profile-settings');
+    const apiUrl = panel.querySelector('#ksm-direct-api-url');
+    const apiKey = panel.querySelector('#ksm-direct-api-key');
+    const model = panel.querySelector('#ksm-direct-model');
+    const keyStatus = panel.querySelector('#ksm-direct-key-status');
     const profile = panel.querySelector('#ksm-profile');
     const maxTokens = panel.querySelector('#ksm-max-tokens');
+    const saveButton = panel.querySelector('[data-action="save-direct"]');
     const testButton = panel.querySelector('[data-action="test-profile"]');
     const profileExists = profiles.some(item => item.id === settings.connectionProfileId);
+    const directConfigured = Boolean(
+        settings.directApiUrl
+        && settings.directModel
+        && settings.directSecretId,
+    );
 
     mode.value = settings.captureMode;
+    directSettings.hidden = settings.captureMode !== 'direct';
+    profileSettings.hidden = settings.captureMode !== 'profile';
+    if (apiUrl.dataset.dirty !== 'true') apiUrl.value = settings.directApiUrl;
+    if (model.dataset.dirty !== 'true') model.value = settings.directModel;
+    apiKey.placeholder = settings.directSecretId
+        ? '已安全保存；留空表示不修改'
+        : '请输入记忆 API 密钥';
+    keyStatus.textContent = settings.directSecretId
+        ? '密钥已保存在酒馆 Secrets 中，插件不会显示或导出原文。'
+        : '尚未保存密钥。';
     profile.innerHTML = [
         '<option value="">请选择记忆 API 连接配置</option>',
         ...profiles.map(item => {
@@ -815,10 +1056,14 @@ function renderSettings(panel) {
             : []),
     ].join('');
     profile.value = settings.connectionProfileId;
-    profile.disabled = settings.captureMode !== 'profile';
-    maxTokens.value = String(settings.maxTokens);
-    maxTokens.disabled = settings.captureMode !== 'profile';
-    testButton.disabled = settings.captureMode !== 'profile' || !profileExists;
+    if (maxTokens.dataset.dirty !== 'true') maxTokens.value = String(settings.maxTokens);
+    maxTokens.disabled = settings.captureMode === 'inline';
+    saveButton.hidden = settings.captureMode !== 'direct';
+    testButton.hidden = settings.captureMode === 'inline';
+    testButton.disabled = settings.captureMode === 'profile' && !profileExists;
+    testButton.title = settings.captureMode === 'direct' && !directConfigured
+        ? '会先保存当前填写内容，再测试连接'
+        : '';
 }
 
 function render() {
@@ -893,7 +1138,7 @@ async function retryLastCapture() {
         toastr.warning('当前聊天还没有可整理的 AI 回复');
         return;
     }
-    if (isProfileMode()) {
+    if (isDedicatedMode()) {
         await queueProfileCapture(messageIndex);
         return;
     }
@@ -935,25 +1180,47 @@ function mountUi() {
                 <label class="ksm-setting-row">
                     <span>工作模式</span>
                     <select id="ksm-capture-mode">
+                        <option value="direct">独立 API（直接填写）</option>
+                        <option value="profile">酒馆连接配置（高级）</option>
                         <option value="inline">正文模型兼容模式</option>
-                        <option value="profile">独立 API（推荐）</option>
                     </select>
                 </label>
                 <p class="ksm-setting-help">
                     独立 API 模式下，正文模型只负责演剧情；回复完成后，由另一条连接单独整理记忆。
                 </p>
-                <label class="ksm-setting-row">
-                    <span>记忆 API</span>
-                    <select id="ksm-profile"></select>
-                </label>
-                <p class="ksm-setting-help">
-                    这里读取酒馆的“连接配置”，密钥仍由酒馆保管，不会写进插件或聊天记录。
-                </p>
+                <div id="ksm-direct-settings">
+                    <label class="ksm-setting-row">
+                        <span>API 地址</span>
+                        <input id="ksm-direct-api-url" type="url" inputmode="url" autocomplete="url" autocapitalize="none" spellcheck="false" placeholder="https://你的接口地址/v1">
+                    </label>
+                    <p class="ksm-setting-help">
+                        使用 OpenAI 兼容格式；填到 <code>/v1</code> 即可。若粘贴了 <code>/chat/completions</code>，保存时会自动移除。
+                    </p>
+                    <label class="ksm-setting-row">
+                        <span>API 密钥</span>
+                        <input id="ksm-direct-api-key" type="password" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="请输入记忆 API 密钥">
+                    </label>
+                    <p id="ksm-direct-key-status" class="ksm-setting-help">尚未保存密钥。</p>
+                    <label class="ksm-setting-row">
+                        <span>模型名称</span>
+                        <input id="ksm-direct-model" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="例如 deepseek-chat">
+                    </label>
+                </div>
+                <div id="ksm-profile-settings" hidden>
+                    <label class="ksm-setting-row">
+                        <span>连接配置</span>
+                        <select id="ksm-profile"></select>
+                    </label>
+                    <p class="ksm-setting-help">
+                        高级选项：读取酒馆已有的 Connection Profile。
+                    </p>
+                </div>
                 <label class="ksm-setting-row">
                     <span>最大输出</span>
                     <input id="ksm-max-tokens" type="number" min="${MIN_MAX_TOKENS}" max="${MAX_MAX_TOKENS}" step="100" inputmode="numeric">
                 </label>
                 <div class="ksm-settings-actions">
+                    <button data-action="save-direct">保存配置</button>
                     <button data-action="test-profile">测试连接</button>
                 </div>
             </section>
@@ -982,6 +1249,16 @@ function mountUi() {
         if (action === 'close') panelOpen = false;
         if (action === 'settings') settingsOpen = !settingsOpen;
         if (action === 'export') downloadJson();
+        if (action === 'save-direct') {
+            runtimeStatus.captureState = 'working';
+            runtimeStatus.captureText = '捕获：正在安全保存独立 API 配置';
+            void saveDirectConfiguration().catch(error => {
+                runtimeStatus.captureState = 'error';
+                runtimeStatus.captureText = `捕获：配置保存失败 · ${error.message}`;
+                toastr.error(`记忆 API 配置保存失败：${error.message}`);
+                render();
+            });
+        }
         if (action === 'test-profile') void testProfileConnection();
         if (action === 'retry-last') void retryLastCapture();
         if (action === 'rebuild' && confirm('将根据当前聊天中保存的记忆标签重建侧栏，继续吗？')) rebuildFromChat();
@@ -996,11 +1273,31 @@ function mountUi() {
         }
         render();
     });
+    document.getElementById('ksm-panel').addEventListener('input', event => {
+        if ([
+            'ksm-direct-api-url',
+            'ksm-direct-api-key',
+            'ksm-direct-model',
+            'ksm-max-tokens',
+        ].includes(event.target.id)) {
+            event.target.dataset.dirty = 'true';
+        }
+    });
     document.getElementById('ksm-panel').addEventListener('change', event => {
         const settings = pluginSettings();
         if (event.target.id === 'ksm-capture-mode') {
-            settings.captureMode = event.target.value === 'profile' ? 'profile' : 'inline';
-            if (settings.captureMode === 'profile') {
+            settings.captureMode = ['direct', 'profile', 'inline'].includes(event.target.value)
+                ? event.target.value
+                : 'direct';
+            if (settings.captureMode === 'direct') {
+                const configured = settings.directApiUrl
+                    && settings.directModel
+                    && settings.directSecretId;
+                runtimeStatus.captureState = configured ? 'idle' : 'warning';
+                runtimeStatus.captureText = configured
+                    ? '捕获：独立 API 已配置，请先测试连接'
+                    : '捕获：请填写地址、密钥和模型';
+            } else if (settings.captureMode === 'profile') {
                 runtimeStatus.captureState = settings.connectionProfileId ? 'idle' : 'warning';
                 runtimeStatus.captureText = settings.connectionProfileId
                     ? '捕获：独立 API 已配置，等待下一轮'
@@ -1025,7 +1322,8 @@ function mountUi() {
                 MIN_MAX_TOKENS,
                 MAX_MAX_TOKENS,
             );
-            savePluginSettings();
+            delete event.target.dataset.dirty;
+            context().saveSettingsDebounced();
         }
     });
     document.getElementById('ksm-import').addEventListener('change', event => {
@@ -1052,9 +1350,9 @@ function registerEvents() {
         ctx.eventSource.on(events.GENERATION_AFTER_COMMANDS, (generationType, _options, dryRun) => {
             if (dryRun || generationType === 'quiet' || generationType === 'impersonate') return;
             rawStreamText = '';
-            trackRawStream = !isProfileMode();
+            trackRawStream = !isDedicatedMode();
             runtimeStatus.captureState = 'working';
-            runtimeStatus.captureText = isProfileMode()
+            runtimeStatus.captureText = isDedicatedMode()
                 ? '捕获：等待正文完成后调用独立 API'
                 : '捕获：等待本轮 AI 回复';
             updateInjection();
@@ -1067,7 +1365,7 @@ function registerEvents() {
     }
     ctx.eventSource.on(events.MESSAGE_RECEIVED, (messageIndex, generationType) => {
         const index = Number(messageIndex);
-        if (generationType !== 'first_message' && isProfileMode()) {
+        if (generationType !== 'first_message' && isDedicatedMode()) {
             trackRawStream = false;
             rawStreamText = '';
             hideMemoryInMessage(index);
@@ -1093,7 +1391,7 @@ function registerEvents() {
             const message = context().chat[Number(messageIndex)];
             if (message && !message.is_user) clearStoredCapture(message);
             runtimeStatus.captureState = 'idle';
-            runtimeStatus.captureText = isProfileMode()
+            runtimeStatus.captureText = isDedicatedMode()
                 ? '捕获：聊天已编辑；如需更新记忆，请点“重试本轮”'
                 : '捕获：聊天已编辑，已按当前内容重建';
             rebuildFromChat();
