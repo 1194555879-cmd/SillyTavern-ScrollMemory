@@ -10,10 +10,11 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.2.1';
-const SETTINGS_VERSION = 2;
+const VERSION = '0.2.2';
+const SETTINGS_VERSION = 3;
 const CUSTOM_SECRET_KEY = 'api_key_custom';
 const DIRECT_SECRET_LABEL = 'Krystal · 卷轴记忆专用 API';
+const MAX_MEMORY_INSTRUCTION_LENGTH = 8000;
 const MAX_SHORT = 20;
 const MAX_LONG = 30;
 const DEFAULT_MAX_TOKENS = 900;
@@ -31,6 +32,21 @@ const BAD_PATTERNS = [
     '边界标签',
     '本轮新增剧情事实',
 ];
+const DEFAULT_MEMORY_INSTRUCTION = `【短期记忆要求】
+1. 每轮有且仅有一条短期记忆。高度概括本轮的核心剧情、关键动作和关键对话，不要遗漏会影响后续剧情理解的重要结果。
+2. 把属于同一事件、连续发生或存在因果关系的动作合并成一条连贯记忆；禁止把一个连续事件拆成逐动作、逐姿势的流水账。
+3. 使用简洁、客观的事实陈述，严格写清“谁对谁做了什么，以及产生了什么结果”。
+4. 保留准确的人名、专有名词、具体物品名和具体称呼；不得张冠李戴。
+5. 删除重复动作、寒暄、气氛描写和没有后续价值的细枝末节。
+
+【长期记忆要求】
+1. 只总结待归档的 20 条短期记忆，不把本轮新增剧情混入长期记忆，不写卷号。
+2. 不设固定字数限制，必须完整覆盖 20 条记忆中会影响后续剧情的核心事实，不得为了缩短而遗漏重要信息。
+3. 优先保留人物关系变化、重要承诺、未解决冲突、关键道具、具体物品名、重要地点、伏笔、长期目标和称呼变化。
+4. 合并重复内容，删除流水账、重复动作、寒暄及没有长期价值的细节。
+
+【通用禁则】
+禁止主观推测、评价、形容性扩写、文学化或诗化表达、情绪渲染和象征性总结。`;
 
 let panelOpen = false;
 let activeTab = 'short';
@@ -52,6 +68,7 @@ const DEFAULT_SETTINGS = {
     directApiUrl: '',
     directModel: '',
     directSecretId: '',
+    memoryInstruction: DEFAULT_MEMORY_INSTRUCTION,
     maxTokens: DEFAULT_MAX_TOKENS,
 };
 
@@ -235,12 +252,14 @@ function pluginSettings() {
     }
     const settings = root[SETTINGS_KEY];
     const previousSettingsVersion = Number(settings.settingsVersion) || 0;
-    if (previousSettingsVersion < SETTINGS_VERSION) {
+    if (previousSettingsVersion < 2) {
         // v0.2.0 only exposed Connection Profiles. If no profile was selected,
         // migrate the empty screen to the new direct-entry mode automatically.
         if (settings.captureMode === 'profile' && !settings.connectionProfileId) {
             settings.captureMode = 'direct';
         }
+    }
+    if (previousSettingsVersion < SETTINGS_VERSION) {
         settings.settingsVersion = SETTINGS_VERSION;
     }
     settings.captureMode = ['direct', 'profile', 'inline'].includes(settings.captureMode)
@@ -250,6 +269,9 @@ function pluginSettings() {
     settings.directApiUrl = String(settings.directApiUrl || '');
     settings.directModel = String(settings.directModel || '');
     settings.directSecretId = String(settings.directSecretId || '');
+    settings.memoryInstruction = String(
+        settings.memoryInstruction || DEFAULT_MEMORY_INSTRUCTION,
+    ).slice(0, MAX_MEMORY_INSTRUCTION_LENGTH);
     settings.maxTokens = clamp(
         Number(settings.maxTokens) || DEFAULT_MAX_TOKENS,
         MIN_MAX_TOKENS,
@@ -355,6 +377,7 @@ function chineseNumber(number) {
 function buildArchiveTask(data) {
     if (data.short.length < MAX_SHORT) return '';
     const lines = data.short.slice(0, MAX_SHORT).map((item, index) => `${index + 1}. ${item.content}`).join('\n');
+    const instruction = pluginSettings().memoryInstruction;
     return `
 【重要系统任务：记忆卷轴归档】
 短期记忆已满。本轮请正常续写剧情，并在正文结尾依次输出以下两段：
@@ -368,11 +391,14 @@ function buildArchiveTask(data) {
 【记忆完】
 
 要求：
-1. 两段缺一不可，不要复述任务说明。
-2. 使用明确的主谓宾句式，禁止文学化、气氛总结和主观评价。
-3. 保留专有名词、具体物品名、人物关系变化、承诺、冲突、伏笔、地点与长期目标。
-4. 同一条中的多个事实直接换行分隔，不要输出 <br> 或其他 HTML 标签。
-5. 长期记忆只总结下方 20 条，不把本轮新增事实混入长期记忆；不要写卷号，卷号由插件生成。
+1. 两段缺一不可，不要复述任务说明。下方可编辑要求只控制内容取舍和概括方式，不得更改边界标签、区块数量或归档范围。
+2. 每个区块只能是一条连贯记忆；可以使用真实换行，但不得把连续动作拆成流水账。
+3. 不要输出 <br> 或其他 HTML 标签。
+4. 长期记忆只总结下方 20 条，不把本轮新增事实混入长期记忆；不要写卷号，卷号由插件生成。
+
+【可编辑的记忆总结要求】
+${instruction}
+【记忆总结要求结束】
 
 【必须归档的 20 条短期记忆】
 ${lines}
@@ -400,11 +426,16 @@ ${history}
     }
 
     const archive = buildArchiveTask(data);
+    const instruction = pluginSettings().memoryInstruction;
     const outputTask = archive || `
-完成本轮正常正文及全部美化标签后，必须在最末尾原样追加下面三段结构。只写一条本轮新增记忆，不得把旧剧情重复写入：
+完成本轮正常正文及全部美化标签后，必须在最末尾原样追加下面三段结构。只写一条本轮新增记忆，不得把旧剧情重复写入。下方可编辑要求只控制内容取舍和概括方式，不得更改边界标签或区块数量：
 【记忆条目】
-使用明确主谓宾总结本轮新增剧情事实；保留人物姓名、地点、具体物品名、关系变化、承诺、冲突与伏笔；同一条中的多个事实直接换行分隔，不要输出 <br> 或其他 HTML 标签；禁止文学化、气氛概括和主观评价。
-【记忆完】`;
+严格按照下方“记忆总结要求”高度概括本轮新增剧情。这里必须是一条连贯记忆，不得逐动作罗列；不要输出 <br> 或其他 HTML 标签。
+【记忆完】
+
+【可编辑的记忆总结要求】
+${instruction}
+【记忆总结要求结束】`;
     return `【卷轴记忆插件：隐藏指令开始】
 你必须同时完成角色扮演正文与卷轴记忆输出。卷轴记忆区块是插件读取所必需的数据，不属于正文，也不受正文美化格式限制，不得省略。
 
@@ -521,16 +552,19 @@ function buildProfileCaptureRequest(messageIndex) {
 【记忆条目】
 只总结“本轮对话”中新发生的剧情事实
 【记忆完】`;
+    const memoryInstruction = pluginSettings().memoryInstruction;
 
     const systemPrompt = `你是独立的剧情记忆整理器，不参与角色扮演，也绝不续写剧情。
-把对话压缩成客观、清晰、可供下一轮调用的事实记忆。
+把对话高度压缩成客观、清晰、可供下一轮调用的事实记忆。
 
-规则：
-1. 准确区分 user 与角色的言行、想法和所属物品，禁止张冠李戴。
-2. 保留人物姓名、地点、具体物品、关系变化、承诺、冲突、伏笔和长期目标。
-3. 使用明确的主谓宾句式；禁止文学化、气氛概括、评价和推测。
-4. 同一区块内的多个事实使用真实换行，不要输出 <br> 或任何 HTML。
-5. 不要复述旧记忆，不要解释任务，不要使用 Markdown 代码块。
+【固定协议】
+1. 严格遵守下方边界标签；不要解释任务，不要使用 Markdown 代码块。可编辑要求只控制内容取舍和概括方式，不得更改本协议。
+2. 每个区块只能包含一条连贯记忆，不得把一个连续事件拆成逐动作流水账。
+3. 不要复述旧记忆；不要输出 <br> 或任何 HTML 标签。
+
+【记忆总结要求】
+${memoryInstruction}
+【记忆总结要求结束】
 
 ${outputFormat}`;
 
@@ -593,6 +627,14 @@ function normalizeDirectApiUrl(value) {
         throw new Error('API 地址必须以 http:// 或 https:// 开头');
     }
     return normalized;
+}
+
+function normalizeMemoryInstruction(value) {
+    const normalized = String(value || '')
+        .replace(/\r\n?/g, '\n')
+        .trim()
+        .slice(0, MAX_MEMORY_INSTRUCTION_LENGTH);
+    return normalized || DEFAULT_MEMORY_INSTRUCTION;
 }
 
 async function secretRequest(path, body) {
@@ -660,6 +702,7 @@ function directFormValues() {
         apiUrl: panel?.querySelector('#ksm-direct-api-url')?.value || '',
         apiKey: panel?.querySelector('#ksm-direct-api-key')?.value || '',
         model: panel?.querySelector('#ksm-direct-model')?.value || '',
+        memoryInstruction: panel?.querySelector('#ksm-memory-instruction')?.value || '',
         maxTokens: panel?.querySelector('#ksm-max-tokens')?.value || DEFAULT_MAX_TOKENS,
     };
 }
@@ -683,6 +726,7 @@ async function saveDirectConfiguration({ notify = true } = {}) {
     settings.directApiUrl = apiUrl;
     settings.directModel = model;
     settings.directSecretId = secretId;
+    settings.memoryInstruction = normalizeMemoryInstruction(form.memoryInstruction);
     settings.maxTokens = clamp(
         Number(form.maxTokens) || DEFAULT_MAX_TOKENS,
         MIN_MAX_TOKENS,
@@ -695,14 +739,60 @@ async function saveDirectConfiguration({ notify = true } = {}) {
         document.getElementById('ksm-direct-api-url'),
         document.getElementById('ksm-direct-api-key'),
         document.getElementById('ksm-direct-model'),
+        document.getElementById('ksm-memory-instruction'),
         document.getElementById('ksm-max-tokens'),
     ].filter(Boolean).forEach(input => delete input.dataset.dirty);
     runtimeStatus.captureState = 'idle';
     runtimeStatus.captureText = '捕获：独立 API 配置已保存，请测试连接';
     updateInjection();
     render();
-    if (notify) toastr.success('记忆 API 配置已安全保存');
+    if (notify) toastr.success('记忆 API 与总结要求已安全保存');
     return settings;
+}
+
+async function saveMemoryConfiguration({ notify = true } = {}) {
+    const settings = pluginSettings();
+    const form = directFormValues();
+    settings.memoryInstruction = normalizeMemoryInstruction(form.memoryInstruction);
+    settings.maxTokens = clamp(
+        Number(form.maxTokens) || DEFAULT_MAX_TOKENS,
+        MIN_MAX_TOKENS,
+        MAX_MAX_TOKENS,
+    );
+    context().saveSettingsDebounced();
+    [
+        document.getElementById('ksm-memory-instruction'),
+        document.getElementById('ksm-max-tokens'),
+    ].filter(Boolean).forEach(input => delete input.dataset.dirty);
+    runtimeStatus.captureState = 'idle';
+    runtimeStatus.captureText = settings.captureMode === 'profile'
+        ? '捕获：总结要求已保存，请测试连接'
+        : '捕获：总结要求已保存，等待下一轮';
+    updateInjection();
+    render();
+    if (notify) toastr.success('记忆总结要求已保存');
+    return settings;
+}
+
+async function saveVisibleConfiguration(options) {
+    if (isDirectMode()) return saveDirectConfiguration(options);
+    return saveMemoryConfiguration(options);
+}
+
+function restoreDefaultMemoryInstruction() {
+    const settings = pluginSettings();
+    settings.memoryInstruction = DEFAULT_MEMORY_INSTRUCTION;
+    context().saveSettingsDebounced();
+    const textarea = document.getElementById('ksm-memory-instruction');
+    if (textarea) {
+        textarea.value = DEFAULT_MEMORY_INSTRUCTION;
+        delete textarea.dataset.dirty;
+    }
+    runtimeStatus.captureState = 'idle';
+    runtimeStatus.captureText = '捕获：已恢复 Mufy 默认总结要求';
+    updateInjection();
+    render();
+    toastr.success('已恢复 Mufy 默认记忆总结要求');
 }
 
 function directResponseText(data) {
@@ -859,9 +949,7 @@ function queueProfileCapture(messageIndex) {
 
 async function testProfileConnection() {
     try {
-        if (isDirectMode()) {
-            await saveDirectConfiguration({ notify: false });
-        }
+        await saveVisibleConfiguration({ notify: false });
         runtimeStatus.captureState = 'working';
         runtimeStatus.captureText = '捕获：正在测试独立 API';
         render();
@@ -1024,8 +1112,9 @@ function renderSettings(panel) {
     const model = panel.querySelector('#ksm-direct-model');
     const keyStatus = panel.querySelector('#ksm-direct-key-status');
     const profile = panel.querySelector('#ksm-profile');
+    const memoryInstruction = panel.querySelector('#ksm-memory-instruction');
     const maxTokens = panel.querySelector('#ksm-max-tokens');
-    const saveButton = panel.querySelector('[data-action="save-direct"]');
+    const saveButton = panel.querySelector('[data-action="save-settings"]');
     const testButton = panel.querySelector('[data-action="test-profile"]');
     const profileExists = profiles.some(item => item.id === settings.connectionProfileId);
     const directConfigured = Boolean(
@@ -1056,9 +1145,12 @@ function renderSettings(panel) {
             : []),
     ].join('');
     profile.value = settings.connectionProfileId;
+    if (memoryInstruction.dataset.dirty !== 'true') {
+        memoryInstruction.value = settings.memoryInstruction;
+    }
     if (maxTokens.dataset.dirty !== 'true') maxTokens.value = String(settings.maxTokens);
     maxTokens.disabled = settings.captureMode === 'inline';
-    saveButton.hidden = settings.captureMode !== 'direct';
+    saveButton.hidden = false;
     testButton.hidden = settings.captureMode === 'inline';
     testButton.disabled = settings.captureMode === 'profile' && !profileExists;
     testButton.title = settings.captureMode === 'direct' && !directConfigured
@@ -1215,12 +1307,20 @@ function mountUi() {
                         高级选项：读取酒馆已有的 Connection Profile。
                     </p>
                 </div>
+                <label class="ksm-setting-block" for="ksm-memory-instruction">
+                    <span>记忆总结要求</span>
+                    <textarea id="ksm-memory-instruction" maxlength="${MAX_MEMORY_INSTRUCTION_LENGTH}" spellcheck="false"></textarea>
+                </label>
+                <p class="ksm-setting-help ksm-setting-help-wide">
+                    默认是原 Mufy 的短期与长期总结规则，可自行修改。“记什么、怎么概括”由这里控制；边界标签和第 21 轮归档仍由插件固定保护。
+                </p>
                 <label class="ksm-setting-row">
                     <span>最大输出</span>
                     <input id="ksm-max-tokens" type="number" min="${MIN_MAX_TOKENS}" max="${MAX_MAX_TOKENS}" step="100" inputmode="numeric">
                 </label>
                 <div class="ksm-settings-actions">
-                    <button data-action="save-direct">保存配置</button>
+                    <button data-action="restore-default-instruction">恢复默认</button>
+                    <button data-action="save-settings">保存设置</button>
                     <button data-action="test-profile">测试连接</button>
                 </div>
             </section>
@@ -1249,16 +1349,17 @@ function mountUi() {
         if (action === 'close') panelOpen = false;
         if (action === 'settings') settingsOpen = !settingsOpen;
         if (action === 'export') downloadJson();
-        if (action === 'save-direct') {
+        if (action === 'save-settings') {
             runtimeStatus.captureState = 'working';
-            runtimeStatus.captureText = '捕获：正在安全保存独立 API 配置';
-            void saveDirectConfiguration().catch(error => {
+            runtimeStatus.captureText = '捕获：正在保存设置';
+            void saveVisibleConfiguration().catch(error => {
                 runtimeStatus.captureState = 'error';
                 runtimeStatus.captureText = `捕获：配置保存失败 · ${error.message}`;
-                toastr.error(`记忆 API 配置保存失败：${error.message}`);
+                toastr.error(`卷轴记忆设置保存失败：${error.message}`);
                 render();
             });
         }
+        if (action === 'restore-default-instruction') restoreDefaultMemoryInstruction();
         if (action === 'test-profile') void testProfileConnection();
         if (action === 'retry-last') void retryLastCapture();
         if (action === 'rebuild' && confirm('将根据当前聊天中保存的记忆标签重建侧栏，继续吗？')) rebuildFromChat();
@@ -1278,6 +1379,7 @@ function mountUi() {
             'ksm-direct-api-url',
             'ksm-direct-api-key',
             'ksm-direct-model',
+            'ksm-memory-instruction',
             'ksm-max-tokens',
         ].includes(event.target.id)) {
             event.target.dataset.dirty = 'true';
