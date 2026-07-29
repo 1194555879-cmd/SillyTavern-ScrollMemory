@@ -166,8 +166,20 @@
     margin: 12px 0 6px;
 }
 
+.ksm-setting-block {
+    display: block;
+    margin: 16px 0 6px;
+}
+
+.ksm-setting-block > span {
+    display: block;
+    margin-bottom: 7px;
+    font-weight: 700;
+}
+
 .ksm-setting-row select,
-.ksm-setting-row input {
+.ksm-setting-row input,
+.ksm-setting-block textarea {
     box-sizing: border-box;
     width: 100%;
     min-width: 0;
@@ -176,6 +188,12 @@
     border-radius: 8px;
     background: var(--SmartThemeBlurTintColor);
     color: var(--SmartThemeBodyColor);
+}
+
+.ksm-setting-block textarea {
+    min-height: 230px;
+    resize: vertical;
+    line-height: 1.5;
 }
 
 .ksm-setting-row select:disabled,
@@ -192,8 +210,13 @@
     line-height: 1.5;
 }
 
+.ksm-setting-help-wide {
+    margin-left: 0;
+}
+
 .ksm-settings-actions {
     justify-content: flex-end;
+    flex-wrap: wrap;
     margin-top: 16px;
 }
 
