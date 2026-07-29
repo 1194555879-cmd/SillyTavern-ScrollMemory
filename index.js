@@ -7,9 +7,12 @@ import {
 const MODULE = 'krystal_scroll_memory';
 const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
-const VERSION = '0.1.4';
+const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
+const VERSION = '0.1.5';
 const MAX_SHORT = 20;
 const MAX_LONG = 30;
+const LAUNCHER_MARGIN = 8;
+const LAUNCHER_DRAG_THRESHOLD = 6;
 const SHORT_RE = /【记忆条目】([\s\S]{1,1200}?)【记忆完】/g;
 const LONG_RE = /【长期记忆条目】([\s\S]{1,4000}?)【长期记忆完】/g;
 const MEMORY_BLOCK_RE = /【长期记忆条目】[\s\S]*?【长期记忆完】|【记忆条目】[\s\S]*?【记忆完】/g;
@@ -32,6 +35,80 @@ const runtimeStatus = {
     captureState: 'idle',
     captureText: '捕获：还没测试',
 };
+
+function clamp(number, minimum, maximum) {
+    return Math.min(Math.max(number, minimum), maximum);
+}
+
+function launcherBounds(launcher) {
+    const width = launcher.offsetWidth || 46;
+    const height = launcher.offsetHeight || 46;
+    const layoutWidth = document.documentElement.clientWidth || window.innerWidth;
+    const layoutHeight = document.documentElement.clientHeight || window.innerHeight;
+    const viewportWidth = Math.min(layoutWidth, window.visualViewport?.width || layoutWidth);
+    const viewportHeight = Math.min(layoutHeight, window.visualViewport?.height || layoutHeight);
+    return {
+        minX: LAUNCHER_MARGIN,
+        maxX: Math.max(LAUNCHER_MARGIN, viewportWidth - width - LAUNCHER_MARGIN),
+        minY: LAUNCHER_MARGIN,
+        maxY: Math.max(LAUNCHER_MARGIN, viewportHeight - height - LAUNCHER_MARGIN),
+    };
+}
+
+function setLauncherPosition(launcher, left, top) {
+    const bounds = launcherBounds(launcher);
+    launcher.style.left = `${clamp(left, bounds.minX, bounds.maxX)}px`;
+    launcher.style.top = `${clamp(top, bounds.minY, bounds.maxY)}px`;
+    launcher.style.right = 'auto';
+    launcher.style.bottom = 'auto';
+}
+
+function readLauncherPosition() {
+    try {
+        const stored = JSON.parse(localStorage.getItem(LAUNCHER_POSITION_KEY));
+        if (!Number.isFinite(stored?.x) || !Number.isFinite(stored?.y)) return null;
+        return {
+            x: clamp(stored.x, 0, 1),
+            y: clamp(stored.y, 0, 1),
+        };
+    } catch {
+        return null;
+    }
+}
+
+function saveLauncherPosition(launcher) {
+    const bounds = launcherBounds(launcher);
+    const rect = launcher.getBoundingClientRect();
+    const width = bounds.maxX - bounds.minX;
+    const height = bounds.maxY - bounds.minY;
+    const position = {
+        x: width > 0 ? clamp((rect.left - bounds.minX) / width, 0, 1) : 0,
+        y: height > 0 ? clamp((rect.top - bounds.minY) / height, 0, 1) : 0,
+    };
+    try {
+        localStorage.setItem(LAUNCHER_POSITION_KEY, JSON.stringify(position));
+    } catch {
+        // Storage can be unavailable in privacy-restricted webviews. Dragging
+        // still works for the current session in that case.
+    }
+}
+
+function restoreLauncherPosition() {
+    const launcher = document.getElementById('ksm-launcher');
+    if (!launcher || launcher.classList.contains('ksm-dragging')) return;
+    const stored = readLauncherPosition();
+    const bounds = launcherBounds(launcher);
+    if (stored) {
+        setLauncherPosition(
+            launcher,
+            bounds.minX + stored.x * (bounds.maxX - bounds.minX),
+            bounds.minY + stored.y * (bounds.maxY - bounds.minY),
+        );
+        return;
+    }
+    const rect = launcher.getBoundingClientRect();
+    setLauncherPosition(launcher, rect.left, rect.top);
+}
 
 function applyViewportGuards() {
     const panel = document.getElementById('ksm-panel');
@@ -58,6 +135,64 @@ function applyViewportGuards() {
         panel.style.removeProperty('top');
         panel.style.removeProperty('max-height');
     }
+    window.requestAnimationFrame(restoreLauncherPosition);
+}
+
+function makeLauncherDraggable(launcher) {
+    let drag = null;
+    let suppressClickUntil = 0;
+
+    launcher.addEventListener('pointerdown', event => {
+        if (event.button !== undefined && event.button !== 0) return;
+        const rect = launcher.getBoundingClientRect();
+        drag = {
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            startLeft: rect.left,
+            startTop: rect.top,
+            moved: false,
+        };
+        launcher.setPointerCapture?.(event.pointerId);
+    });
+
+    launcher.addEventListener('pointermove', event => {
+        if (!drag || event.pointerId !== drag.pointerId) return;
+        const deltaX = event.clientX - drag.startX;
+        const deltaY = event.clientY - drag.startY;
+        if (!drag.moved && Math.hypot(deltaX, deltaY) < LAUNCHER_DRAG_THRESHOLD) return;
+        drag.moved = true;
+        event.preventDefault();
+        launcher.classList.add('ksm-dragging');
+        setLauncherPosition(launcher, drag.startLeft + deltaX, drag.startTop + deltaY);
+    });
+
+    const finishDrag = event => {
+        if (!drag || event.pointerId !== drag.pointerId) return;
+        if (drag.moved) {
+            event.preventDefault();
+            saveLauncherPosition(launcher);
+            suppressClickUntil = performance.now() + 500;
+        }
+        launcher.classList.remove('ksm-dragging');
+        if (launcher.hasPointerCapture?.(event.pointerId)) {
+            launcher.releasePointerCapture(event.pointerId);
+        }
+        drag = null;
+    };
+
+    launcher.addEventListener('pointerup', finishDrag);
+    launcher.addEventListener('pointercancel', finishDrag);
+    launcher.addEventListener('click', event => {
+        if (performance.now() < suppressClickUntil) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }
+        suppressClickUntil = 0;
+        panelOpen = !panelOpen;
+        render();
+    });
 }
 
 function emptyState() {
@@ -402,7 +537,7 @@ function importJson(file) {
 function mountUi() {
     if (document.getElementById('ksm-launcher')) return;
     document.body.insertAdjacentHTML('beforeend', `
-        <button id="ksm-launcher" type="button" title="卷轴记忆">📜</button>
+        <button id="ksm-launcher" type="button" title="卷轴记忆（可拖动）" aria-label="卷轴记忆（可拖动）">📜</button>
         <div id="ksm-panel" role="dialog" aria-label="卷轴记忆">
             <header class="ksm-title">
                 <div><strong>Krystal · 卷轴记忆</strong><small>v${VERSION}</small></div>
@@ -427,10 +562,8 @@ function mountUi() {
     applyViewportGuards();
     window.addEventListener('resize', applyViewportGuards);
     window.addEventListener('orientationchange', applyViewportGuards);
-    document.getElementById('ksm-launcher').addEventListener('click', () => {
-        panelOpen = !panelOpen;
-        render();
-    });
+    window.visualViewport?.addEventListener('resize', applyViewportGuards);
+    makeLauncherDraggable(document.getElementById('ksm-launcher'));
     document.getElementById('ksm-panel').addEventListener('click', event => {
         const button = event.target.closest('button');
         if (!button) return;
