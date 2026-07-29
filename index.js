@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 3;
 const SOURCE_DIGEST_VERSION = 2;
@@ -1853,9 +1853,12 @@ function render() {
     panel.classList.toggle('ksm-open', panelOpen);
     panel.classList.toggle('ksm-settings-open', settingsOpen);
     panel.classList.toggle('ksm-preview-open', injectionPreviewOpen);
-    panel.querySelector('[data-tab="short"]').classList.toggle('active', activeTab === 'short');
-    panel.querySelector('[data-tab="long"]').classList.toggle('active', activeTab === 'long');
-    panel.querySelector('[data-tab="facts"]').classList.toggle('active', activeTab === 'facts');
+    for (const tab of panel.querySelectorAll('[data-tab]')) {
+        const selected = tab.dataset.tab === activeTab;
+        tab.classList.toggle('active', selected);
+        tab.setAttribute('aria-selected', String(selected));
+    }
+    panel.querySelector('[data-action="settings"]').classList.toggle('active', settingsOpen);
     panel.querySelector('#ksm-short-count').textContent = `${data.short.length}/${MAX_SHORT}`;
     panel.querySelector('#ksm-long-count').textContent = `${data.long.length}/${MAX_LONG}`;
     panel.querySelector('#ksm-fact-count').textContent = `${data.facts.length}/${MAX_FACTS}`;
@@ -1868,28 +1871,46 @@ function render() {
     const bootstrapButton = panel.querySelector('[data-action="bootstrap-facts"]');
     if (bootstrapButton) {
         bootstrapButton.disabled = factBootstrapRunning;
-        bootstrapButton.textContent = factBootstrapRunning ? '整理中…' : '整理细节';
+        const buttonLabel = bootstrapButton.querySelector('.ksm-button-label');
+        if (buttonLabel) {
+            buttonLabel.textContent = factBootstrapRunning ? '整理中…' : '整理细节';
+        } else {
+            bootstrapButton.textContent = factBootstrapRunning ? '整理中…' : '整理细节';
+        }
     }
     const items = activeTab === 'short'
         ? data.short
         : (activeTab === 'long' ? data.long : data.facts);
     panel.querySelector('#ksm-list').innerHTML = items.length
         ? items.map(item => `
-            <article class="ksm-item" data-id="${escapeHtml(item.id)}">
-                <header>${escapeHtml(
-                    activeTab === 'facts'
-                        ? `${item.category} · ${item.key}`
-                        : (item.label || `短期记忆 ${data.short.indexOf(item) + 1}`),
-                )}</header>
+            <article class="ksm-item ksm-item-${activeTab}" data-id="${escapeHtml(item.id)}">
+                <header>
+                    <span class="ksm-item-mark" aria-hidden="true">
+                        <i class="fa-solid ${activeTab === 'facts' ? 'fa-bookmark' : (activeTab === 'long' ? 'fa-book-open' : 'fa-feather-pointed')}"></i>
+                    </span>
+                    <span>${escapeHtml(
+                        activeTab === 'facts'
+                            ? `${item.category} · ${item.key}`
+                            : (item.label || `短期记忆 ${data.short.indexOf(item) + 1}`),
+                    )}</span>
+                </header>
                 <textarea>${escapeHtml(item.content)}</textarea>
                 <div class="ksm-item-actions">
-                    <button data-action="save-item">保存</button>
-                    <button data-action="delete-item">删除</button>
+                    <button data-action="save-item"><i class="fa-solid fa-check"></i><span>保存</span></button>
+                    <button data-action="delete-item"><i class="fa-solid fa-trash-can"></i><span>删除</span></button>
                 </div>
             </article>`).join('')
         : (activeTab === 'facts'
-            ? '<div class="ksm-empty">这里还没有细节事实。点底部“整理细节”，可从现有长期与短期记忆自动建立。</div>'
-            : '<div class="ksm-empty">这里还没有记忆。</div>');
+            ? `<div class="ksm-empty">
+                    <span class="ksm-empty-icon"><i class="fa-solid fa-wand-magic-sparkles"></i></span>
+                    <strong>还没有细节事实</strong>
+                    <span>点底部“整理细节”，从现有长期与短期记忆自动建立。</span>
+                </div>`
+            : `<div class="ksm-empty">
+                    <span class="ksm-empty-icon"><i class="fa-solid fa-feather-pointed"></i></span>
+                    <strong>这里还没有记忆</strong>
+                    <span>继续聊天后，本轮摘要会自动出现在这里。</span>
+                </div>`);
     renderSettings(panel);
     renderInjectionPreview(panel);
 }
@@ -2087,19 +2108,31 @@ async function retryLastCapture() {
 function mountUi() {
     if (document.getElementById('ksm-launcher')) return;
     document.body.insertAdjacentHTML('beforeend', `
-        <button id="ksm-launcher" type="button" title="卷轴记忆（可拖动）" aria-label="卷轴记忆（可拖动）">📜</button>
+        <button id="ksm-launcher" type="button" title="卷轴记忆（可拖动）" aria-label="卷轴记忆（可拖动）">
+            <i class="fa-solid fa-scroll" aria-hidden="true"></i>
+        </button>
         <div id="ksm-panel" role="dialog" aria-label="卷轴记忆">
             <header class="ksm-title">
-                <div><strong>Krystal · 卷轴记忆</strong><small>v${VERSION}</small></div>
+                <div class="ksm-brand">
+                    <span class="ksm-brand-mark" aria-hidden="true">K</span>
+                    <span class="ksm-brand-copy">
+                        <strong>Krystal · 卷轴记忆</strong>
+                        <small>Memory archive · v${VERSION}</small>
+                    </span>
+                </div>
                 <div class="ksm-title-actions">
-                    <button data-action="settings" title="记忆 API 设置" aria-label="记忆 API 设置">⚙</button>
-                    <button data-action="close" title="关闭" aria-label="关闭">×</button>
+                    <button data-action="settings" title="记忆 API 设置" aria-label="记忆 API 设置">
+                        <i class="fa-solid fa-sliders" aria-hidden="true"></i>
+                    </button>
+                    <button data-action="close" title="关闭" aria-label="关闭">
+                        <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                    </button>
                 </div>
             </header>
-            <nav class="ksm-tabs">
-                <button data-tab="short">短期 <span id="ksm-short-count">0/20</span></button>
-                <button data-tab="long">长期 <span id="ksm-long-count">0/30</span></button>
-                <button data-tab="facts">细节 <span id="ksm-fact-count">0/${MAX_FACTS}</span></button>
+            <nav class="ksm-tabs" role="tablist" aria-label="记忆类型">
+                <button data-tab="short" role="tab"><span class="ksm-tab-label">短期</span><span class="ksm-tab-count" id="ksm-short-count">0/20</span></button>
+                <button data-tab="long" role="tab"><span class="ksm-tab-label">长期</span><span class="ksm-tab-count" id="ksm-long-count">0/30</span></button>
+                <button data-tab="facts" role="tab"><span class="ksm-tab-label">细节</span><span class="ksm-tab-count" id="ksm-fact-count">0/${MAX_FACTS}</span></button>
             </nav>
             <section class="ksm-status" aria-live="polite">
                 <div data-status="injection" data-state="idle"><span class="ksm-status-dot"></span><span>注入：等待选择聊天</span></div>
@@ -2107,7 +2140,10 @@ function mountUi() {
             </section>
             <section id="ksm-list"></section>
             <section id="ksm-settings" aria-label="记忆 API 设置">
-                <h3>记忆生成方式</h3>
+                <div class="ksm-section-heading">
+                    <span class="ksm-section-icon"><i class="fa-solid fa-sliders"></i></span>
+                    <span><h3>记忆生成方式</h3><small>连接、模型与总结指令</small></span>
+                </div>
                 <label class="ksm-setting-row">
                     <span>工作模式</span>
                     <select id="ksm-capture-mode">
@@ -2161,30 +2197,41 @@ function mountUi() {
                     <input id="ksm-max-tokens" type="number" min="${MIN_MAX_TOKENS}" max="${MAX_MAX_TOKENS}" step="100" inputmode="numeric">
                 </label>
                 <div class="ksm-settings-actions">
-                    <button data-action="restore-default-instruction">恢复默认</button>
-                    <button data-action="save-settings">保存设置</button>
-                    <button data-action="test-profile">测试连接</button>
+                    <button data-action="restore-default-instruction"><i class="fa-solid fa-rotate-left"></i><span>恢复默认</span></button>
+                    <button data-action="save-settings"><i class="fa-solid fa-floppy-disk"></i><span>保存设置</span></button>
+                    <button data-action="test-profile"><i class="fa-solid fa-plug"></i><span>测试连接</span></button>
                 </div>
             </section>
             <section id="ksm-injection-preview" aria-label="实际注入内容">
-                <h3>本轮实际注入</h3>
+                <div class="ksm-section-heading">
+                    <span class="ksm-section-icon"><i class="fa-solid fa-eye"></i></span>
+                    <span><h3>本轮实际注入</h3><small>检查酒馆实际登记的记忆内容</small></span>
+                </div>
                 <p id="ksm-injection-meta" class="ksm-preview-meta"></p>
                 <textarea id="ksm-injection-text" readonly spellcheck="false"></textarea>
                 <p class="ksm-setting-help ksm-setting-help-wide">
                     “酒馆登记成功”证明这段内容已交给提示词系统；生成后仍可在 Prompt Itemization 中搜索“历史记忆-开始”，确认最终请求没有被上下文裁剪。模型是否真正采用，只能再用剧情细节进行行为验证。
                 </p>
                 <div class="ksm-settings-actions">
-                    <button data-action="copy-injection">复制</button>
-                    <button data-action="close-injection">返回</button>
+                    <button data-action="copy-injection"><i class="fa-solid fa-copy"></i><span>复制内容</span></button>
+                    <button data-action="close-injection"><i class="fa-solid fa-arrow-left"></i><span>返回</span></button>
                 </div>
             </section>
             <footer class="ksm-footer">
-                <button data-action="rebuild">从当前聊天重建</button>
-                <button data-action="retry-last">重试本轮</button>
-                <button data-action="bootstrap-facts">整理细节</button>
-                <button data-action="view-injection">查看注入</button>
-                <button data-action="export">导出</button>
-                <label>导入<input id="ksm-import" type="file" accept=".json,application/json"></label>
+                <div class="ksm-footer-primary">
+                    <button data-action="retry-last">
+                        <i class="fa-solid fa-rotate-right"></i><span>重试本轮</span>
+                    </button>
+                    <button data-action="bootstrap-facts">
+                        <i class="fa-solid fa-wand-magic-sparkles"></i><span class="ksm-button-label">整理细节</span>
+                    </button>
+                </div>
+                <div class="ksm-footer-secondary">
+                    <button data-action="view-injection"><i class="fa-solid fa-eye"></i><span>查看注入</span></button>
+                    <button data-action="rebuild"><i class="fa-solid fa-arrows-rotate"></i><span>重建</span></button>
+                    <button data-action="export"><i class="fa-solid fa-upload"></i><span>导出</span></button>
+                    <label><i class="fa-solid fa-download"></i><span>导入</span><input id="ksm-import" type="file" accept=".json,application/json"></label>
+                </div>
             </footer>
         </div>`);
 
