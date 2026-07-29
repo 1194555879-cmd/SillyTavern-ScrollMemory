@@ -8,7 +8,7 @@ const MODULE = 'krystal_scroll_memory';
 const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
-const VERSION = '0.1.5';
+const VERSION = '0.1.6';
 const MAX_SHORT = 20;
 const MAX_LONG = 30;
 const LAUNCHER_MARGIN = 8;
@@ -218,6 +218,15 @@ function state() {
     data.short = Array.isArray(data.short) ? data.short : [];
     data.long = Array.isArray(data.long) ? data.long : [];
     data.volumeCount = Number(data.volumeCount) || 0;
+    let normalized = false;
+    for (const item of [...data.short, ...data.long]) {
+        if (!item || typeof item !== 'object') continue;
+        const content = clean(item.content);
+        if (item.content === content) continue;
+        item.content = content;
+        normalized = true;
+    }
+    if (normalized) ctx.saveMetadataDebounced();
     return data;
 }
 
@@ -236,7 +245,13 @@ function hash(text) {
 }
 
 function clean(text) {
-    return String(text || '').trim().replace(/\n{3,}/g, '\n\n');
+    return String(text || '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/<br\b[^>]*>/gi, '\n')
+        .replace(/&lt;br\s*\/?&gt;/gi, '\n')
+        .replace(/[ \t]+\n/g, '\n')
+        .trim()
+        .replace(/\n{3,}/g, '\n\n');
 }
 
 function isNoise(text) {
@@ -272,7 +287,7 @@ function buildArchiveTask(data) {
 1. 两段缺一不可，不要复述任务说明。
 2. 使用明确的主谓宾句式，禁止文学化、气氛总结和主观评价。
 3. 保留专有名词、具体物品名、人物关系变化、承诺、冲突、伏笔、地点与长期目标。
-4. 同一条中的多个事实使用 <br> 分隔。
+4. 同一条中的多个事实直接换行分隔，不要输出 <br> 或其他 HTML 标签。
 5. 长期记忆只总结下方 20 条，不把本轮新增事实混入长期记忆；不要写卷号，卷号由插件生成。
 
 【必须归档的 20 条短期记忆】
@@ -288,7 +303,7 @@ function buildPayload() {
     const outputTask = archive || `
 完成本轮正常正文及全部美化标签后，必须在最末尾原样追加下面三段结构。只写一条本轮新增记忆，不得把旧剧情重复写入：
 【记忆条目】
-使用明确主谓宾总结本轮新增剧情事实；保留人物姓名、地点、具体物品名、关系变化、承诺、冲突与伏笔；同一条中的多个事实用 <br> 分隔；禁止文学化、气氛概括和主观评价。
+使用明确主谓宾总结本轮新增剧情事实；保留人物姓名、地点、具体物品名、关系变化、承诺、冲突与伏笔；同一条中的多个事实直接换行分隔，不要输出 <br> 或其他 HTML 标签；禁止文学化、气氛概括和主观评价。
 【记忆完】`;
     return `【卷轴记忆插件：隐藏指令开始】
 你必须同时完成角色扮演正文与卷轴记忆输出。卷轴记忆区块是插件读取所必需的数据，不属于正文，也不受正文美化格式限制，不得省略。
