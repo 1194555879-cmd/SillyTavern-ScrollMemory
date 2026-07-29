@@ -61,6 +61,38 @@
     background: rgb(197 155 109 / 20%);
 }
 
+.ksm-status {
+    margin: 0 12px 8px;
+    padding: 8px 10px;
+    border: 1px solid rgb(255 255 255 / 10%);
+    border-radius: 10px;
+    background: rgb(0 0 0 / 8%);
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.ksm-status > div {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+}
+
+.ksm-status > div + div { margin-top: 3px; }
+
+.ksm-status-dot {
+    flex: 0 0 auto;
+    width: 8px;
+    height: 8px;
+    margin-top: 4px;
+    border-radius: 50%;
+    background: #8c8c8c;
+}
+
+.ksm-status [data-state="success"] .ksm-status-dot { background: #55b978; }
+.ksm-status [data-state="working"] .ksm-status-dot { background: #d7a941; }
+.ksm-status [data-state="warning"] .ksm-status-dot { background: #df8e3d; }
+.ksm-status [data-state="error"] .ksm-status-dot { background: #dc5353; }
+
 #ksm-panel button,
 .ksm-footer label {
     padding: 7px 10px;
