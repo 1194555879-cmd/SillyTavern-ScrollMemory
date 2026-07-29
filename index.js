@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.3';
+const VERSION = '0.3.4';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 4;
 const SOURCE_DIGEST_VERSION = 2;
@@ -264,7 +264,9 @@ function makeLauncherDraggable(launcher) {
             return;
         }
         suppressClickUntil = 0;
-        panelOpen = !panelOpen;
+        const opening = !panelOpen;
+        panelOpen = opening;
+        if (opening) refreshCurrentChatState({ showStatus: true });
         render();
     });
 }
@@ -1845,6 +1847,28 @@ function rebuildFromChat() {
         runtimeStatus.captureText = `捕获：${rebuilt.staleArchiveCount} 卷已因分支变化回退为短期记忆，将在后续回复重建`;
     }
     save();
+    return rebuilt;
+}
+
+function refreshCurrentChatState({ showStatus = false } = {}) {
+    const ctx = context();
+    if (!ctx.chatId) return null;
+    const before = state();
+    const beforeShort = before.short.length;
+    detachImportedTerminalMemory();
+    const rebuilt = rebuildFromChat();
+    if (showStatus && runtimeStatus.captureState !== 'working') {
+        const recovered = Math.max(0, rebuilt.short.length - beforeShort);
+        const latestIndex = latestAssistantMessageIndex();
+        const latestHasCapture = latestIndex >= 0
+            && Boolean(readStoredCapture(ctx.chat[latestIndex]));
+        runtimeStatus.captureState = recovered > 0 ? 'success' : 'idle';
+        runtimeStatus.captureText = recovered > 0
+            ? `捕获：自动重建找回 ${recovered} 条短期记忆 · 当前 ${rebuilt.short.length}/${MAX_SHORT}`
+            : `捕获：已自动核对楼层底片 · 最后一轮${latestHasCapture ? '有' : '没有'}底片 · 当前短期 ${rebuilt.short.length}/${MAX_SHORT}`;
+        render();
+    }
+    return rebuilt;
 }
 
 function hideMemoryInMessage(messageIndex) {
@@ -2588,8 +2612,7 @@ function registerEvents() {
     ctx.eventSource.on(events.CHAT_CHANGED, () => {
         generationInProgress = false;
         clearScheduledProfileCaptures();
-        const detached = detachImportedTerminalMemory();
-        if (detached.detached) rebuildFromChat();
+        refreshCurrentChatState();
         updateInjection();
         render();
         window.setTimeout(hideAllMemoryBlocks, 50);
@@ -2698,10 +2721,10 @@ function init() {
     initialized = true;
     mountUi();
     registerEvents();
-    detachImportedTerminalMemory();
-    if (context().chatId) rebuildFromChat();
+    refreshCurrentChatState();
     updateInjection();
     render();
+    window.setTimeout(refreshCurrentChatState, 600);
     window.setTimeout(hideAllMemoryBlocks, 100);
     console.info(`[Krystal Scroll Memory] v${VERSION} loaded`);
 }
