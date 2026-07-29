@@ -1,12 +1,12 @@
 {
-  "display_name": "Krystal · 卷轴记忆",
-  "loading_order": 50,
-  "requires": [],
-  "optional": [],
-  "js": "index.js",
-  "css": "style.css",
-  "author": "Krystal & Claude; SillyTavern adaptation by GPT",
-  "version": "0.3.6",
-  "homePage": "https://github.com/1194555879-cmd/SillyTavern-ScrollMemory",
-  "auto_update": true
+    "display_name": "Krystal · 卷轴记忆",
+    "loading_order": 50,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Krystal & Claude; SillyTavern adaptation by GPT",
+    "version": "0.3.7",
+    "homePage": "https://github.com/1194555879-cmd/SillyTavern-ScrollMemory",
+    "auto_update": true
 }
