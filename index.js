@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.2';
+const VERSION = '0.3.3';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 4;
 const SOURCE_DIGEST_VERSION = 2;
@@ -82,8 +82,11 @@ let initialized = false;
 let trackRawStream = false;
 let rawStreamText = '';
 let captureQueue = Promise.resolve();
+let generationInProgress = false;
 let factBootstrapRunning = false;
 const openFactCategories = new Set();
+const scheduledProfileCaptures = new Map();
+const pendingProfileCaptures = new Map();
 const runtimeStatus = {
     injectionState: 'idle',
     injectionText: '注入：等待选择聊天',
@@ -1276,7 +1279,7 @@ async function sendDedicatedRequest(messages, maxTokens = pluginSettings().maxTo
     return sendProfileRequest(messages, maxTokens);
 }
 
-async function captureMessageWithProfile(messageIndex, snapshot) {
+async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
     const current = context();
     const message = current.chat[messageIndex];
     if (!message || message.is_user) return false;
@@ -1312,13 +1315,20 @@ async function captureMessageWithProfile(messageIndex, snapshot) {
             throw new Error('短期记忆已满，但记忆 API 没有返回长期归档标签');
         }
 
+        const replacedExistingCapture = Boolean(readStoredCapture(latestMessage));
         writeStoredCapture(latestMessage, capture, `独立 API · ${label}`, {
             archiveSourceDigest: request.archiveSourceDigest,
         });
         rebuildFromChat();
         await latest.saveChat();
+        const currentState = state();
+        const action = options.reason === 'retry'
+            ? (replacedExistingCapture
+                ? '重试已替换本轮原总结（不会重复新增）'
+                : '重试已补写本轮总结')
+            : (replacedExistingCapture ? '自动已更新本轮总结' : '自动已新增本轮总结');
         runtimeStatus.captureState = 'success';
-        runtimeStatus.captureText = `捕获：成功 · 独立 API（${label}）· 短期 ${capture.short.length} / 长期 ${capture.long.length} / 细节 ${capture.facts.length}`;
+        runtimeStatus.captureText = `捕获：${action} · 独立 API（${label}）· 当前短期 ${currentState.short.length}/${MAX_SHORT} · 本轮细节 ${capture.facts.length}`;
         render();
         return true;
     } catch (error) {
@@ -1331,19 +1341,98 @@ async function captureMessageWithProfile(messageIndex, snapshot) {
     }
 }
 
-function queueProfileCapture(messageIndex) {
+function resolveAssistantMessageIndex(messageIndex) {
     const ctx = context();
-    const message = ctx.chat[messageIndex];
+    const numericIndex = messageIndex === undefined || messageIndex === null
+        ? Number.NaN
+        : Number(messageIndex);
+    if (Number.isInteger(numericIndex)) {
+        const candidate = ctx.chat[numericIndex];
+        if (candidate && !candidate.is_user) return numericIndex;
+    }
+    return latestAssistantMessageIndex();
+}
+
+function profileCaptureKey(chatId, messageIndex, message) {
+    return [
+        String(chatId || ''),
+        messageIndex,
+        Number(message?.swipe_id || 0),
+        hash(String(message?.mes || '')),
+    ].join('␟');
+}
+
+function queueProfileCapture(messageIndex, options = {}) {
+    const ctx = context();
+    const resolvedIndex = resolveAssistantMessageIndex(messageIndex);
+    const message = ctx.chat[resolvedIndex];
     if (!message || message.is_user) return Promise.resolve(false);
+    const force = Boolean(options.force);
+    if (!force && readStoredCapture(message)) return Promise.resolve(false);
     const snapshot = {
         chatId: ctx.chatId,
         messageText: String(message.mes || ''),
         swipeId: Number(message.swipe_id || 0),
     };
-    captureQueue = captureQueue
+    const key = profileCaptureKey(snapshot.chatId, resolvedIndex, message);
+    const pending = pendingProfileCaptures.get(key);
+    if (pending) return pending;
+
+    const task = captureQueue
         .catch(() => false)
-        .then(() => captureMessageWithProfile(messageIndex, snapshot));
-    return captureQueue;
+        .then(() => {
+            const latest = context();
+            const latestMessage = latest.chat[resolvedIndex];
+            if (latest.chatId !== snapshot.chatId
+                || !latestMessage
+                || latestMessage.is_user
+                || String(latestMessage.mes || '') !== snapshot.messageText
+                || Number(latestMessage.swipe_id || 0) !== snapshot.swipeId) {
+                return false;
+            }
+            if (!force && readStoredCapture(latestMessage)) return false;
+            return captureMessageWithProfile(resolvedIndex, snapshot, options);
+        });
+    pendingProfileCaptures.set(key, task);
+    captureQueue = task.catch(() => false);
+    void task.finally(() => {
+        if (pendingProfileCaptures.get(key) === task) pendingProfileCaptures.delete(key);
+    }).catch(() => false);
+    return task;
+}
+
+function scheduleProfileCapture(messageIndex, generationType = 'normal', delay = 140) {
+    if (!isDedicatedMode() || generationType === 'first_message') return;
+    const ctx = context();
+    const chatId = String(ctx.chatId || '');
+    const numericIndex = messageIndex === undefined || messageIndex === null
+        ? Number.NaN
+        : Number(messageIndex);
+    const timerKey = `${chatId}:${Number.isInteger(numericIndex) ? numericIndex : 'latest'}`;
+    const previousTimer = scheduledProfileCaptures.get(timerKey);
+    if (previousTimer) window.clearTimeout(previousTimer);
+    const timer = window.setTimeout(() => {
+        scheduledProfileCaptures.delete(timerKey);
+        if (String(context().chatId || '') !== chatId) return;
+        if (generationType === 'swipe-select' && generationInProgress) return;
+        const resolvedIndex = resolveAssistantMessageIndex(messageIndex);
+        const message = context().chat[resolvedIndex];
+        if (!message || message.is_user || !String(message.mes || '').trim()) return;
+        const force = ['swipe', 'regenerate', 'continue', 'append', 'appendFinal']
+            .includes(String(generationType));
+        hideMemoryInMessage(resolvedIndex);
+        void queueProfileCapture(resolvedIndex, {
+            force,
+            reason: 'auto',
+            generationType,
+        });
+    }, delay);
+    scheduledProfileCaptures.set(timerKey, timer);
+}
+
+function clearScheduledProfileCaptures() {
+    for (const timer of scheduledProfileCaptures.values()) window.clearTimeout(timer);
+    scheduledProfileCaptures.clear();
 }
 
 async function testProfileConnection() {
@@ -1451,6 +1540,8 @@ function readStoredCapture(message) {
         long: Array.isArray(stored.long) ? unique(stored.long) : [],
         facts: normalizeFactOps(stored.facts),
         archiveSourceDigest: String(stored.archiveSourceDigest || ''),
+        capturedAt: Number(stored.capturedAt) || 0,
+        source: String(stored.source || ''),
     };
     return hasCapture(capture) ? capture : null;
 }
@@ -1679,10 +1770,20 @@ function buildStateFromChat(endExclusive = context().chat.length) {
         { origin: 'seed' },
     );
 
-    for (let index = startIndex; index < end; index++) {
+    for (let index = 0; index < end; index++) {
         const message = ctx.chat[index];
         if (!message || message.is_user) continue;
         const stored = readStoredCapture(message);
+        const capturedAfterImport = Boolean(
+            baseline
+            && stored?.capturedAt
+            && stored.capturedAt >= baseline.importedAt,
+        );
+        // A stale imported archive can point past the end of a migrated or
+        // shortened chat. Captures created after that archive was imported are
+        // new dynamic floors, so they must still participate in the rebuild
+        // even when their numeric index is below the old static boundary.
+        if (index < startIndex && !capturedAfterImport) continue;
         const longs = stored?.long ?? extract(LONG_RE, message.mes);
         const shorts = stored?.short ?? extract(SHORT_RE, message.mes);
         const facts = stored?.facts ?? parseFactLines(message.mes);
@@ -2163,7 +2264,14 @@ async function retryLastCapture() {
     const detached = detachImportedTerminalMemory();
     if (detached.detached) rebuildFromChat();
     if (isDedicatedMode()) {
-        await queueProfileCapture(messageIndex);
+        const captured = await queueProfileCapture(messageIndex, {
+            force: true,
+            reason: 'retry',
+            generationType: 'retry',
+        });
+        if (captured) {
+            toastr.success('已重新整理并替换最后一轮原总结；不会新增重复条目');
+        }
         return;
     }
     const captured = captureMessage(messageIndex, 'retry');
@@ -2478,6 +2586,8 @@ function registerEvents() {
         events.CONNECTION_PROFILE_DELETED,
     ].filter(Boolean).forEach(event => ctx.eventSource.on(event, render));
     ctx.eventSource.on(events.CHAT_CHANGED, () => {
+        generationInProgress = false;
+        clearScheduledProfileCaptures();
         const detached = detachImportedTerminalMemory();
         if (detached.detached) rebuildFromChat();
         updateInjection();
@@ -2487,6 +2597,7 @@ function registerEvents() {
     if (events.GENERATION_AFTER_COMMANDS) {
         ctx.eventSource.on(events.GENERATION_AFTER_COMMANDS, (generationType, _options, dryRun) => {
             if (dryRun || generationType === 'quiet' || generationType === 'impersonate') return;
+            generationInProgress = true;
             if (generationType === 'swipe' || generationType === 'regenerate') {
                 const detached = detachImportedTerminalMemory();
                 if (detached.detached) rebuildFromChat();
@@ -2506,12 +2617,13 @@ function registerEvents() {
         });
     }
     ctx.eventSource.on(events.MESSAGE_RECEIVED, (messageIndex, generationType) => {
-        const index = Number(messageIndex);
+        generationInProgress = false;
+        const index = resolveAssistantMessageIndex(messageIndex);
         if (generationType !== 'first_message' && isDedicatedMode()) {
             trackRawStream = false;
             rawStreamText = '';
             hideMemoryInMessage(index);
-            void queueProfileCapture(index);
+            scheduleProfileCapture(index, generationType);
             return;
         }
         if (generationType !== 'first_message') {
@@ -2522,11 +2634,25 @@ function registerEvents() {
         trackRawStream = false;
         rawStreamText = '';
     });
+    if (events.CHARACTER_MESSAGE_RENDERED) {
+        ctx.eventSource.on(events.CHARACTER_MESSAGE_RENDERED, (messageIndex, generationType) => {
+            if (generationType === 'first_message' || !isDedicatedMode()) return;
+            generationInProgress = false;
+            // Some mobile wrappers finish persisting the selected swipe only
+            // after MESSAGE_RECEIVED. This second official event is a harmless
+            // fallback; the scheduler and pending-key map deduplicate it.
+            scheduleProfileCapture(messageIndex, generationType);
+        });
+    }
+    [events.GENERATION_ENDED, events.GENERATION_STOPPED]
+        .filter(Boolean)
+        .forEach(event => ctx.eventSource.on(event, () => {
+            generationInProgress = false;
+        }));
     if (events.MESSAGE_SWIPED) {
         ctx.eventSource.on(events.MESSAGE_SWIPED, (messageIndex, meta = {}) => {
             const detached = detachImportedTerminalMemory();
-            const numericIndex = Number(messageIndex);
-            const index = Number.isInteger(numericIndex) ? numericIndex : latestAssistantMessageIndex();
+            const index = resolveAssistantMessageIndex(messageIndex);
             const message = context().chat[index];
             if (message && !message.is_user) syncCaptureFromCurrentSwipe(message);
             rebuildFromChat();
@@ -2536,9 +2662,9 @@ function registerEvents() {
                 && message
                 && !message.is_user
                 && !readStoredCapture(message)) {
-                void queueProfileCapture(index);
+                scheduleProfileCapture(index, 'swipe-select', 360);
             } else if (detached.needsCapture && !meta?.pendingGeneration && isDedicatedMode()) {
-                void queueProfileCapture(detached.messageIndex);
+                scheduleProfileCapture(detached.messageIndex, 'swipe-select', 360);
             }
         });
     }
