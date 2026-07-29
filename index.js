@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.6';
+const VERSION = '0.3.7';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 4;
 const SOURCE_DIGEST_VERSION = 2;
@@ -84,6 +84,8 @@ let rawStreamText = '';
 let captureQueue = Promise.resolve();
 let generationInProgress = false;
 let factBootstrapRunning = false;
+let actionFeedbackTimer = 0;
+let pendingDelete = null;
 const openFactCategories = new Set();
 const scheduledProfileCaptures = new Map();
 const pendingProfileCaptures = new Map();
@@ -2147,6 +2149,91 @@ function renderFactGroups(items, data) {
         .join('');
 }
 
+
+const TAB_PRESENTATION = {
+    short: { title: '短期记忆', hint: '近期剧情摘要', icon: 'fa-feather-pointed' },
+    long: { title: '长期记忆', hint: '归档后的剧情卷轴', icon: 'fa-book-open' },
+    facts: { title: '细节记忆', hint: '人物、关系与关键线索', icon: 'fa-bookmark' },
+};
+
+function replayClass(element, className, duration = 360) {
+    if (!element) return;
+    element.classList.remove(className);
+    void element.offsetWidth;
+    element.classList.add(className);
+    window.setTimeout(() => element.classList.remove(className), duration);
+}
+
+function showActionFeedback(message, state = 'success', duration = 1800) {
+    const feedback = document.getElementById('ksm-action-feedback');
+    if (!feedback) return;
+    window.clearTimeout(actionFeedbackTimer);
+    feedback.hidden = false;
+    feedback.dataset.state = state;
+    const icon = feedback.querySelector('i');
+    if (icon) {
+        icon.className = state === 'working'
+            ? 'fa-solid fa-spinner'
+            : (state === 'error' ? 'fa-solid fa-circle-exclamation' : 'fa-solid fa-circle-check');
+    }
+    const copy = feedback.querySelector('.ksm-action-feedback-copy');
+    if (copy) copy.textContent = message;
+    replayClass(feedback, 'is-visible', 420);
+    if (duration > 0) {
+        actionFeedbackTimer = window.setTimeout(() => {
+            feedback.classList.remove('is-visible');
+            window.setTimeout(() => { feedback.hidden = true; }, 220);
+        }, duration);
+    }
+}
+
+function hideDeleteConfirmation() {
+    pendingDelete = null;
+    const prompt = document.getElementById('ksm-delete-confirm');
+    if (prompt) {
+        prompt.classList.remove('is-visible');
+        window.setTimeout(() => { prompt.hidden = true; }, 180);
+    }
+}
+
+function requestDeleteConfirmation(item, kind, label) {
+    pendingDelete = { id: item.id, kind, label };
+    const prompt = document.getElementById('ksm-delete-confirm');
+    if (!prompt) return;
+    prompt.querySelector('.ksm-delete-confirm-copy').textContent = `确定删除“${label}”吗？`;
+    prompt.hidden = false;
+    replayClass(prompt, 'is-visible', 420);
+}
+
+function confirmPendingDelete() {
+    if (!pendingDelete) return;
+    const { id, kind, label } = pendingDelete;
+    const data = state();
+    const list = kind === 'short' ? data.short : (kind === 'long' ? data.long : data.facts);
+    const item = list.find(candidate => candidate.id === id);
+    if (!item) {
+        hideDeleteConfirmation();
+        showActionFeedback('这条记忆已经不存在', 'error');
+        return;
+    }
+    const persisted = kind === 'facts'
+        ? persistFactChange(item, 'delete')
+        : persistMemoryItemChange(item, kind, 'delete');
+    hideDeleteConfirmation();
+    if (!persisted) {
+        toastr.warning('这条记忆来自未迁移的旧标签，暂时无法持久修改');
+        showActionFeedback('删除失败：这条旧记忆暂时无法修改', 'error', 2600);
+        return;
+    }
+    render();
+    showActionFeedback(`已删除：${label}`);
+}
+
+function animateCurrentView() {
+    replayClass(document.getElementById('ksm-current-view'), 'is-switching', 420);
+    replayClass(document.getElementById('ksm-list'), 'is-switching', 420);
+}
+
 function render() {
     const panel = document.getElementById('ksm-panel');
     if (!panel) return;
@@ -2164,6 +2251,10 @@ function render() {
     panel.querySelector('#ksm-short-count').textContent = `${data.short.length}/${MAX_SHORT}`;
     panel.querySelector('#ksm-long-count').textContent = `${data.long.length}/${MAX_LONG}`;
     panel.querySelector('#ksm-fact-count').textContent = `${data.facts.length}/${MAX_FACTS}`;
+    const tabPresentation = TAB_PRESENTATION[activeTab];
+    panel.querySelector('#ksm-current-view-icon').className = `fa-solid ${tabPresentation.icon}`;
+    panel.querySelector('#ksm-current-view-title').textContent = tabPresentation.title;
+    panel.querySelector('#ksm-current-view-hint').textContent = tabPresentation.hint;
     const injectionStatus = panel.querySelector('[data-status="injection"]');
     const captureStatus = panel.querySelector('[data-status="capture"]');
     injectionStatus.dataset.state = runtimeStatus.injectionState;
@@ -2432,6 +2523,13 @@ function mountUi() {
                 <div data-status="injection" data-state="idle"><span class="ksm-status-dot"></span><span>注入：等待选择聊天</span></div>
                 <div data-status="capture" data-state="idle"><span class="ksm-status-dot"></span><span>捕获：还没测试</span></div>
             </section>
+            <section id="ksm-current-view" class="ksm-current-view" aria-live="polite">
+                <span class="ksm-current-view-mark" aria-hidden="true"><i id="ksm-current-view-icon" class="fa-solid fa-feather-pointed"></i></span>
+                <span class="ksm-current-view-copy">
+                    <strong id="ksm-current-view-title">短期记忆</strong>
+                    <small id="ksm-current-view-hint">近期剧情摘要</small>
+                </span>
+            </section>
             <section id="ksm-list"></section>
             <section id="ksm-settings" aria-label="记忆 API 设置">
                 <div class="ksm-section-heading">
@@ -2522,6 +2620,17 @@ function mountUi() {
                     <button data-action="close-injection"><i class="fa-solid fa-arrow-left"></i><span>返回</span></button>
                 </div>
             </section>
+            <div id="ksm-action-feedback" class="ksm-action-feedback" role="status" aria-live="polite" hidden>
+                <i class="fa-solid fa-circle-check" aria-hidden="true"></i>
+                <span class="ksm-action-feedback-copy">操作完成</span>
+            </div>
+            <div id="ksm-delete-confirm" class="ksm-delete-confirm" role="alertdialog" aria-label="确认删除" hidden>
+                <span class="ksm-delete-confirm-copy">确定删除这条记忆吗？</span>
+                <span class="ksm-delete-confirm-actions">
+                    <button data-action="cancel-delete">取消</button>
+                    <button data-action="confirm-delete" class="ksm-confirm-danger">确认删除</button>
+                </span>
+            </div>
             <footer class="ksm-footer">
                 <div class="ksm-footer-primary">
                     <button data-action="retry-last">
@@ -2546,13 +2655,26 @@ function mountUi() {
     window.addEventListener('orientationchange', applyViewportGuards);
     window.visualViewport?.addEventListener('resize', applyViewportGuards);
     makeLauncherDraggable(document.getElementById('ksm-launcher'));
-    document.getElementById('ksm-panel').addEventListener('click', event => {
+    const panel = document.getElementById('ksm-panel');
+    panel.addEventListener('pointerdown', event => {
+        const button = event.target.closest('button');
+        if (!button || button.disabled) return;
+        replayClass(button, 'ksm-press-feedback', 320);
+    });
+    panel.addEventListener('click', event => {
         const button = event.target.closest('button');
         if (!button) return;
         if (button.dataset.tab) {
-            activeTab = button.dataset.tab;
+            const nextTab = button.dataset.tab;
+            const changed = nextTab !== activeTab;
+            activeTab = nextTab;
             injectionPreviewOpen = false;
+            hideDeleteConfirmation();
             render();
+            if (changed) {
+                animateCurrentView();
+                showActionFeedback(`已切换到${TAB_PRESENTATION[activeTab].title}`, 'success', 1200);
+            }
             return;
         }
         const action = button.dataset.action;
@@ -2566,9 +2688,27 @@ function mountUi() {
             injectionPreviewOpen = true;
         }
         if (action === 'close-injection') injectionPreviewOpen = false;
-        if (action === 'copy-injection') void copyInjectionPreview();
-        if (action === 'export') downloadJson();
-        if (action === 'import') document.getElementById('ksm-import')?.click();
+        if (action === 'copy-injection') {
+            void copyInjectionPreview();
+            showActionFeedback('注入内容已复制');
+        }
+        if (action === 'export') {
+            downloadJson();
+            showActionFeedback('记忆文件已导出');
+        }
+        if (action === 'import') {
+            document.getElementById('ksm-import')?.click();
+            showActionFeedback('请选择要导入的记忆文件', 'working', 1600);
+        }
+        if (action === 'cancel-delete') {
+            hideDeleteConfirmation();
+            showActionFeedback('已取消删除', 'success', 1100);
+            return;
+        }
+        if (action === 'confirm-delete') {
+            confirmPendingDelete();
+            return;
+        }
         if (action === 'toggle-fact-group') {
             const category = button.closest('.ksm-fact-group')?.dataset.category;
             if (category) {
@@ -2595,7 +2735,11 @@ function mountUi() {
         if (action === 'test-profile') void testProfileConnection();
         if (action === 'retry-last') void retryLastCapture();
         if (action === 'bootstrap-facts') void bootstrapFactsFromMemory();
-        if (action === 'rebuild' && confirm('将根据当前聊天中保存的记忆标签重建侧栏，继续吗？')) rebuildFromChat();
+        if (action === 'rebuild' && confirm('将根据当前聊天中保存的记忆标签重建侧栏，继续吗？')) {
+            showActionFeedback('正在重建当前记忆…', 'working', 0);
+            rebuildFromChat();
+            showActionFeedback('当前记忆已重建');
+        }
         if (action === 'save-item' || action === 'delete-item') {
             const article = button.closest('.ksm-item');
             const data = state();
@@ -2604,20 +2748,20 @@ function mountUi() {
                 : (activeTab === 'long' ? data.long : data.facts);
             const index = list.findIndex(item => item.id === article.dataset.id);
             if (index >= 0) {
+                const item = list[index];
+                const label = article.querySelector('.ksm-item-label')?.textContent || '这条记忆';
+                if (action === 'delete-item') {
+                    requestDeleteConfirmation(item, activeTab, label);
+                    return;
+                }
                 const persisted = activeTab === 'facts'
-                    ? persistFactChange(
-                        list[index],
-                        action === 'save-item' ? 'save' : 'delete',
-                        article.querySelector('textarea').value,
-                    )
-                    : persistMemoryItemChange(
-                        list[index],
-                        activeTab,
-                        action === 'save-item' ? 'save' : 'delete',
-                        article.querySelector('textarea').value,
-                    );
+                    ? persistFactChange(item, 'save', article.querySelector('textarea').value)
+                    : persistMemoryItemChange(item, activeTab, 'save', article.querySelector('textarea').value);
                 if (!persisted) {
                     toastr.warning('这条记忆来自未迁移的旧标签，暂时无法持久修改');
+                    showActionFeedback('保存失败：这条旧记忆暂时无法修改', 'error', 2600);
+                } else {
+                    showActionFeedback(`已保存：${label}`);
                 }
             }
         }
