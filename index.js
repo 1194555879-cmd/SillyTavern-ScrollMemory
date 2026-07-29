@@ -10,8 +10,8 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.2.4';
-const STATE_VERSION = 2;
+const VERSION = '0.3.0';
+const STATE_VERSION = 3;
 const SETTINGS_VERSION = 3;
 const SOURCE_DIGEST_VERSION = 2;
 const CUSTOM_SECRET_KEY = 'api_key_custom';
@@ -19,6 +19,9 @@ const DIRECT_SECRET_LABEL = 'Krystal · 卷轴记忆专用 API';
 const MAX_MEMORY_INSTRUCTION_LENGTH = 8000;
 const MAX_SHORT = 20;
 const MAX_LONG = 30;
+const MAX_FACTS = 80;
+const MAX_FACT_KEY_LENGTH = 80;
+const MAX_FACT_CONTENT_LENGTH = 500;
 const DEFAULT_MAX_TOKENS = 900;
 const MIN_MAX_TOKENS = 200;
 const MAX_MAX_TOKENS = 4000;
@@ -26,7 +29,17 @@ const LAUNCHER_MARGIN = 8;
 const LAUNCHER_DRAG_THRESHOLD = 6;
 const SHORT_RE = /【记忆条目】([\s\S]{1,1200}?)【记忆完】/g;
 const LONG_RE = /【长期记忆条目】([\s\S]{1,4000}?)【长期记忆完】/g;
-const MEMORY_BLOCK_RE = /【长期记忆条目】[\s\S]*?【长期记忆完】|【记忆条目】[\s\S]*?【记忆完】/g;
+const FACT_RE = /【细节记忆】([\s\S]{1,8000}?)【细节记忆完】/g;
+const MEMORY_BLOCK_RE = /【长期记忆条目】[\s\S]*?【长期记忆完】|【记忆条目】[\s\S]*?【记忆完】|【细节记忆】[\s\S]*?【细节记忆完】/g;
+const FACT_CATEGORIES = [
+    '人物与关系',
+    '秘密与知情',
+    '物品与地点',
+    '承诺与日期',
+    '身体与习惯',
+    '未解线索',
+    '其他',
+];
 const BAD_PATTERNS = [
     '重要系统任务',
     '记忆卷轴归档',
@@ -55,15 +68,22 @@ const DEFAULT_MEMORY_INSTRUCTION = `【短期记忆要求】
 let panelOpen = false;
 let activeTab = 'short';
 let settingsOpen = false;
+let injectionPreviewOpen = false;
 let initialized = false;
 let trackRawStream = false;
 let rawStreamText = '';
 let captureQueue = Promise.resolve();
+let factBootstrapRunning = false;
 const runtimeStatus = {
     injectionState: 'idle',
     injectionText: '注入：等待选择聊天',
     captureState: 'idle',
     captureText: '捕获：还没测试',
+    preparedAt: 0,
+    preparedChatId: '',
+    preparedDigest: '',
+    preparedLength: 0,
+    preparedPayload: '',
 };
 const DEFAULT_SETTINGS = {
     settingsVersion: SETTINGS_VERSION,
@@ -240,6 +260,9 @@ function emptyState() {
         version: STATE_VERSION,
         short: [],
         long: [],
+        facts: [],
+        factSeed: [],
+        manualFacts: [],
         volumeCount: 0,
         baseline: null,
         baselineStatus: 'none',
@@ -331,6 +354,9 @@ function state() {
     data.version = STATE_VERSION;
     data.short = Array.isArray(data.short) ? data.short : [];
     data.long = Array.isArray(data.long) ? data.long : [];
+    data.facts = normalizeFactItems(data.facts, 'state');
+    data.factSeed = normalizeFactItems(data.factSeed, 'seed');
+    data.manualFacts = normalizeFactOps(data.manualFacts);
     data.volumeCount = Number(data.volumeCount) || 0;
     data.baseline = normalizeBaseline(data.baseline);
     data.baselineStatus = ['none', 'fresh', 'stale'].includes(data.baselineStatus)
@@ -338,7 +364,7 @@ function state() {
         : 'none';
     data.staleArchiveCount = Number(data.staleArchiveCount) || 0;
     let normalized = false;
-    for (const item of [...data.short, ...data.long]) {
+    for (const item of [...data.short, ...data.long, ...data.facts, ...data.factSeed]) {
         if (!item || typeof item !== 'object') continue;
         const content = clean(item.content);
         if (item.content === content) continue;
@@ -415,14 +441,17 @@ function createSourceSnapshot(chat, requestedCount = chat.length) {
         throughMessageIndex: messages.length - 1,
         throughSendDate: normalizedSendDate(lastMessage?.send_date),
         prefixDigest: chatPrefixDigest(messages, SOURCE_DIGEST_VERSION),
+        beforeLastPrefixDigest: messages.length > 1
+            ? chatPrefixDigest(messages.slice(0, -1), SOURCE_DIGEST_VERSION)
+            : '',
         lastMessageDigest: lastMessage ? messageSnapshotDigest(lastMessage, SOURCE_DIGEST_VERSION) : '',
     };
 }
 
 function normalizeSource(source) {
     if (!source || typeof source !== 'object') return null;
+    if (source.chatMessages === undefined || source.chatMessages === null) return null;
     const chatMessages = Math.max(0, Number(source.chatMessages) || 0);
-    if (!chatMessages) return null;
     return {
         ...source,
         digestVersion: Math.max(1, Number(source.digestVersion) || 1),
@@ -431,6 +460,7 @@ function normalizeSource(source) {
             ? Number(source.throughMessageIndex)
             : chatMessages - 1,
         prefixDigest: String(source.prefixDigest || ''),
+        beforeLastPrefixDigest: String(source.beforeLastPrefixDigest || ''),
         lastMessageDigest: String(source.lastMessageDigest || ''),
     };
 }
@@ -459,21 +489,143 @@ function normalizeMemoryItems(items, kind, origin = 'baseline') {
         .filter(Boolean);
 }
 
+function normalizeFactCategory(value) {
+    const category = clean(value);
+    if (FACT_CATEGORIES.includes(category)) return category;
+    const aliases = {
+        人物: '人物与关系',
+        关系: '人物与关系',
+        人物关系: '人物与关系',
+        秘密: '秘密与知情',
+        知情: '秘密与知情',
+        知情边界: '秘密与知情',
+        物品: '物品与地点',
+        地点: '物品与地点',
+        道具: '物品与地点',
+        承诺: '承诺与日期',
+        日期: '承诺与日期',
+        时间: '承诺与日期',
+        身体: '身体与习惯',
+        习惯: '身体与习惯',
+        伤病: '身体与习惯',
+        线索: '未解线索',
+        伏笔: '未解线索',
+        修正: '其他',
+    };
+    return aliases[category] || '其他';
+}
+
+function normalizeFactKey(value) {
+    return clean(value)
+        .replace(/[｜|]/g, '／')
+        .replace(/\s+/g, ' ')
+        .slice(0, MAX_FACT_KEY_LENGTH);
+}
+
+function factId(category, key) {
+    return `f-${hash(`${normalizeFactCategory(category)}␟${normalizeFactKey(key).toLocaleLowerCase()}`)}`;
+}
+
+function normalizeFactOps(items) {
+    if (!Array.isArray(items)) return [];
+    return items
+        .map(item => {
+            if (!item || typeof item !== 'object') return null;
+            const action = item.action === 'delete' ? 'delete' : 'upsert';
+            const category = normalizeFactCategory(item.category);
+            const key = normalizeFactKey(item.key);
+            const content = clean(item.content).slice(0, MAX_FACT_CONTENT_LENGTH);
+            if (!key || (action === 'upsert' && !content)) return null;
+            return {
+                action,
+                category,
+                key,
+                content: action === 'delete' ? '' : content,
+                updatedAt: Number(item.updatedAt) || Date.now(),
+            };
+        })
+        .filter(Boolean);
+}
+
+function normalizeFactItems(items, origin = 'baseline') {
+    if (!Array.isArray(items)) return [];
+    const result = [];
+    for (const item of items) {
+        const source = item && typeof item === 'object' ? item : null;
+        if (!source) continue;
+        const category = normalizeFactCategory(source.category);
+        const key = normalizeFactKey(source.key || source.label);
+        const content = clean(source.content).slice(0, MAX_FACT_CONTENT_LENGTH);
+        if (!key || !content) continue;
+        const id = factId(category, key);
+        const normalized = {
+            ...source,
+            id,
+            category,
+            key,
+            content,
+            origin,
+            updatedAt: Number(source.updatedAt) || Date.now(),
+        };
+        const previous = result.findIndex(candidate => candidate.id === id);
+        if (previous >= 0) result.splice(previous, 1);
+        result.push(normalized);
+    }
+    return result.slice(-MAX_FACTS);
+}
+
+function applyFactOps(target, operations, metadata = {}) {
+    for (let captureIndex = 0; captureIndex < operations.length; captureIndex++) {
+        const operation = operations[captureIndex];
+        const id = factId(operation.category, operation.key);
+        const existing = target.findIndex(item => item.id === id);
+        if (operation.action === 'delete') {
+            if (existing >= 0) target.splice(existing, 1);
+            continue;
+        }
+        const item = {
+            id,
+            category: operation.category,
+            key: operation.key,
+            content: operation.content,
+            updatedAt: Number(operation.updatedAt) || Date.now(),
+            captureKind: 'facts',
+            captureIndex,
+            ...metadata,
+        };
+        if (existing >= 0) target.splice(existing, 1);
+        target.push(item);
+    }
+    if (target.length > MAX_FACTS) target.splice(0, target.length - MAX_FACTS);
+}
+
+function applyManualFactOps(target, operations) {
+    for (const operation of operations) {
+        const id = factId(operation.category, operation.key);
+        const existing = target.find(item => item.id === id);
+        if (existing && Number(existing.updatedAt) > Number(operation.updatedAt)) continue;
+        applyFactOps(target, [operation], { origin: 'manual' });
+    }
+}
+
 function normalizeBaseline(baseline) {
     if (!baseline || typeof baseline !== 'object') return null;
     const short = normalizeMemoryItems(baseline.short, 'short');
     const long = normalizeMemoryItems(baseline.long, 'long');
-    if (!short.length && !long.length) return null;
+    const facts = normalizeFactItems(baseline.facts, 'baseline');
+    if (!short.length && !long.length && !facts.length) return null;
     return {
-        version: 1,
+        version: 2,
         short,
         long,
+        facts,
         volumeCount: Math.max(
             Number(baseline.volumeCount) || 0,
             ...long.map(item => Number(item.volume) || 0),
         ),
         source: normalizeSource(baseline.source),
         importedAt: Number(baseline.importedAt) || Date.now(),
+        terminalDetached: Boolean(baseline.terminalDetached),
     };
 }
 
@@ -532,7 +684,7 @@ function buildArchiveTask(data) {
     const instruction = pluginSettings().memoryInstruction;
     return `
 【重要系统任务：记忆卷轴归档】
-短期记忆已满。本轮请正常续写剧情，并在正文结尾依次输出以下两段：
+短期记忆已满。本轮请正常续写剧情，并在正文结尾依次输出以下三段：
 
 【长期记忆条目】
 把下方 20 条短期记忆压缩成一条客观、清晰、可供后续剧情调用的长期记忆。
@@ -542,9 +694,13 @@ function buildArchiveTask(data) {
 只总结本轮新增剧情事实。
 【记忆完】
 
+【细节记忆】
+按“新增/更新｜类别｜稳定键｜客观事实”或“删除｜类别｜稳定键｜-”逐行记录本轮新增、变化或失效的稳定细节；类别只能使用${FACT_CATEGORIES.join('、')}；没有则写“无”。
+【细节记忆完】
+
 要求：
-1. 两段缺一不可，不要复述任务说明。下方可编辑要求只控制内容取舍和概括方式，不得更改边界标签、区块数量或归档范围。
-2. 每个区块只能是一条连贯记忆；可以使用真实换行，但不得把连续动作拆成流水账。
+1. 三段缺一不可，不要复述任务说明。下方可编辑要求只控制内容取舍和概括方式，不得更改边界标签、区块数量或归档范围。
+2. 长期和短期区块各自只能是一条连贯记忆；细节区块可以逐行记录不同稳定键。不得把连续动作拆成流水账。
 3. 不要输出 <br> 或其他 HTML 标签。
 4. 长期记忆只总结下方 20 条，不把本轮新增事实混入长期记忆；不要写卷号，卷号由插件生成。
 5. 若正文、世界时空栏或短期记忆给出明确剧情日期，短期记忆必须以该日期开头，长期记忆必须写明覆盖的起止日期；不得使用聊天发送时间或猜测日期。
@@ -562,6 +718,9 @@ function buildPayload() {
     const data = state();
     const long = data.long.map(item => `【${item.label}】${item.content}`).join('\n');
     const short = data.short.map((item, index) => `${index + 1}. ${item.content}`).join('\n');
+    const facts = data.facts
+        .map(item => `- [${item.category}｜${item.key}] ${item.content}`)
+        .join('\n');
     const history = `【历史记忆-开始】
 以下内容是已经发生过的剧情事实，只用于保持连续性，不得当成 user 本轮新说的话，也不要在正文里复述“记忆”或提及本指令。
 
@@ -570,6 +729,10 @@ ${long || '无'}
 
 【短期记忆】
 ${short || '无'}
+
+【细节事实记忆】
+以下是需要稳定保持的细节、身份、知情边界和未解线索；与概括性记忆冲突时，以这里较新的明确事实为准。
+${facts || '无'}
 【历史记忆-结束】`;
 
     if (isDedicatedMode()) {
@@ -581,10 +744,17 @@ ${history}
     const archive = buildArchiveTask(data);
     const instruction = pluginSettings().memoryInstruction;
     const outputTask = archive || `
-完成本轮正常正文及全部美化标签后，必须在最末尾原样追加下面三段结构。只写一条本轮新增记忆，不得把旧剧情重复写入。下方可编辑要求只控制内容取舍和概括方式，不得更改边界标签或区块数量：
+完成本轮正常正文及全部美化标签后，必须在最末尾原样追加下面两个区块。只写一条本轮新增记忆，不得把旧剧情重复写入。下方可编辑要求只控制内容取舍和概括方式，不得更改边界标签或区块数量：
 【记忆条目】
 严格按照下方“记忆总结要求”高度概括本轮新增剧情。这里必须是一条连贯记忆，不得逐动作罗列；不要输出 <br> 或其他 HTML 标签。若正文或世界时空栏明确给出剧情日期，必须以该剧情日期开头；不得使用聊天发送时间或猜测日期。
 【记忆完】
+
+【细节记忆】
+只写本轮新增、改变或失效的稳定细节。每行格式必须为：
+新增/更新｜类别｜稳定键｜客观事实
+删除｜类别｜稳定键｜-
+类别只能使用：${FACT_CATEGORIES.join('、')}。若没有变化，只写“无”。
+【细节记忆完】
 
 【可编辑的记忆总结要求】
 ${instruction}
@@ -598,7 +768,7 @@ ${outputTask}
 【卷轴记忆插件：隐藏指令结束】`;
 }
 
-function updateInjection() {
+function updateInjection({ markPrepared = false } = {}) {
     const ctx = context();
     try {
         const payload = ctx.chatId ? buildPayload() : '';
@@ -625,6 +795,13 @@ function updateInjection() {
             runtimeStatus.injectionText = isDedicatedMode()
                 ? `注入：已装载历史记忆 · 独立 API 模式 · ${payload.length} 字`
                 : `注入：已装载 · user 层 · ${payload.length} 字`;
+            if (markPrepared) {
+                runtimeStatus.preparedAt = Date.now();
+                runtimeStatus.preparedChatId = String(ctx.chatId || '');
+                runtimeStatus.preparedDigest = hash(payload);
+                runtimeStatus.preparedLength = payload.length;
+                runtimeStatus.preparedPayload = payload;
+            }
         } else {
             runtimeStatus.injectionState = 'warning';
             runtimeStatus.injectionText = '注入：已调用，但酒馆未返回登记状态';
@@ -646,15 +823,44 @@ function unique(items) {
     return [...new Set(items.map(clean).filter(Boolean))];
 }
 
+function parseFactLines(text) {
+    const operations = [];
+    FACT_RE.lastIndex = 0;
+    for (const match of String(text || '').matchAll(FACT_RE)) {
+        const lines = clean(match[1]).split('\n');
+        for (const rawLine of lines) {
+            const line = rawLine.replace(/^\s*(?:[-*•]|\d+[.、])\s*/, '').trim();
+            if (!line || /^(?:无|没有|无变化|无需更新)[。.]?$/.test(line)) continue;
+            const parts = line.split(/[｜|]/).map(part => clean(part));
+            if (parts.length < 3) continue;
+            const verb = parts[0].replace(/\s+/g, '');
+            const deleting = /^(?:删除|移除|作废)$/.test(verb);
+            const category = normalizeFactCategory(parts[1]);
+            const key = normalizeFactKey(parts[2]);
+            const content = deleting ? '' : clean(parts.slice(3).join('｜')).slice(0, MAX_FACT_CONTENT_LENGTH);
+            if (!key || (!deleting && !content)) continue;
+            operations.push({
+                action: deleting ? 'delete' : 'upsert',
+                category,
+                key,
+                content,
+                updatedAt: Date.now(),
+            });
+        }
+    }
+    return normalizeFactOps(operations);
+}
+
 function extractCapture(text) {
     return {
         short: unique(extract(SHORT_RE, text)),
         long: unique(extract(LONG_RE, text)),
+        facts: parseFactLines(text),
     };
 }
 
 function hasCapture(capture) {
-    return Boolean(capture.short.length || capture.long.length);
+    return Boolean(capture?.short?.length || capture?.long?.length || capture?.facts?.length);
 }
 
 function stripMemoryBlocks(text) {
@@ -698,19 +904,28 @@ function buildProfileCaptureRequest(messageIndex) {
         : data.short.slice(-6))
         .map((item, index) => `${index + 1}. ${item.content}`)
         .join('\n');
+    const factContext = data.facts
+        .map(item => `${item.category}｜${item.key}｜${item.content}`)
+        .join('\n');
 
     const outputFormat = archiveRequired
-        ? `你必须按顺序输出且只输出以下两个区块：
+        ? `你必须按顺序输出且只输出以下三个区块：
 【长期记忆条目】
 把“待归档短期记忆”中的 20 条压缩成一条长期记忆
 【长期记忆完】
 【记忆条目】
 只总结“本轮对话”中新发生的剧情事实
-【记忆完】`
-        : `你必须只输出以下区块：
+【记忆完】
+【细节记忆】
+逐行输出本轮需要新增、更新或删除的稳定细节；没有变化只写“无”
+【细节记忆完】`
+        : `你必须按顺序输出且只输出以下两个区块：
 【记忆条目】
 只总结“本轮对话”中新发生的剧情事实
-【记忆完】`;
+【记忆完】
+【细节记忆】
+逐行输出本轮需要新增、更新或删除的稳定细节；没有变化只写“无”
+【细节记忆完】`;
     const memoryInstruction = pluginSettings().memoryInstruction;
 
     const systemPrompt = `你是独立的剧情记忆整理器，不参与角色扮演，也绝不续写剧情。
@@ -718,9 +933,11 @@ function buildProfileCaptureRequest(messageIndex) {
 
 【固定协议】
 1. 严格遵守下方边界标签；不要解释任务，不要使用 Markdown 代码块。可编辑要求只控制内容取舍和概括方式，不得更改本协议。
-2. 每个区块只能包含一条连贯记忆，不得把一个连续事件拆成逐动作流水账。
+2. 【记忆条目】和【长期记忆条目】各自只能包含一条连贯记忆，不得把一个连续事件拆成逐动作流水账。
 3. 不要复述旧记忆；不要输出 <br> 或任何 HTML 标签。
 4. 若“本轮对话”或其世界时空栏明确给出剧情日期，【记忆条目】必须以该日期开头；若待归档短期记忆含有日期，【长期记忆条目】必须写明覆盖的起止日期。不得把聊天发送时间当成剧情时间，也不得猜测未给出的日期。
+5. 【细节记忆】只记录跨轮仍有用的稳定事实：人物身份与关系、秘密及谁知道什么、关键物品与地点、承诺与日期、身体伤病与习惯、未解决线索。普通动作、气氛和已存在且未变化的事实不要重复。
+6. 【细节记忆】每行必须严格使用“新增/更新｜类别｜稳定键｜客观事实”或“删除｜类别｜稳定键｜-”。类别只能是：${FACT_CATEGORIES.join('、')}。同一事实必须沿用现有稳定键；事实改变时更新原键，禁止换键后重复。若没有变化，只写“无”。
 
 【记忆总结要求】
 ${memoryInstruction}
@@ -734,6 +951,9 @@ user：${ctx.name1 || 'user'}
 
 ${archiveRequired ? '【待归档短期记忆】' : '【最近短期记忆，仅用于去重与指代判断】'}
 ${memoryContext || '无'}
+
+【现有细节事实，仅用于沿用稳定键、识别冲突和避免重复】
+${factContext || '无'}
 
 【本轮对话】
 ${currentTurn || '无'}
@@ -766,6 +986,7 @@ function captureFromApiResponse(text) {
         return {
             short: unique(Array.isArray(parsed.short) ? parsed.short : [parsed.short || parsed.memory]),
             long: unique(Array.isArray(parsed.long) ? parsed.long : [parsed.long || parsed.archive]),
+            facts: normalizeFactOps(parsed.facts),
         };
     } catch {
         return tagged;
@@ -1050,6 +1271,7 @@ async function captureMessageWithProfile(messageIndex, snapshot) {
         || Number(message.swipe_id || 0) !== snapshot.swipeId) {
         return false;
     }
+    detachImportedTerminalMemory();
 
     runtimeStatus.captureState = 'working';
     runtimeStatus.captureText = '捕获：独立 API 正在整理本轮记忆';
@@ -1082,7 +1304,7 @@ async function captureMessageWithProfile(messageIndex, snapshot) {
         rebuildFromChat();
         await latest.saveChat();
         runtimeStatus.captureState = 'success';
-        runtimeStatus.captureText = `捕获：成功 · 独立 API（${label}）· 短期 ${capture.short.length} / 长期 ${capture.long.length}`;
+        runtimeStatus.captureText = `捕获：成功 · 独立 API（${label}）· 短期 ${capture.short.length} / 长期 ${capture.long.length} / 细节 ${capture.facts.length}`;
         render();
         return true;
     } catch (error) {
@@ -1131,28 +1353,110 @@ async function testProfileConnection() {
     render();
 }
 
+function buildFactBootstrapRequest() {
+    const data = state();
+    const long = data.long.map(item => `【${item.label}】${item.content}`).join('\n\n');
+    const short = data.short.map((item, index) => `${index + 1}. ${item.content}`).join('\n');
+    return [
+        {
+            role: 'system',
+            content: `你是剧情事实数据库整理器。请从已有长期与短期记忆中提取跨轮仍有用的稳定细节，不续写剧情，不猜测。
+
+必须只输出：
+【细节记忆】
+新增/更新｜类别｜稳定键｜客观事实
+【细节记忆完】
+
+类别只能是：${FACT_CATEGORIES.join('、')}。
+稳定键应简短且能长期复用，例如“顾明远身份”“方伊慈-林夕死因知情边界”“段逐闲车内大白兔”。
+同一事实只保留一条；冲突时采用时间更晚、表达更明确的版本。必须区分“事实本身”和“谁知道该事实”。不要收录普通动作、气氛、修辞和一次性对话。最多输出 ${MAX_FACTS} 条。`,
+        },
+        {
+            role: 'user',
+            content: `【长期记忆】
+${long || '无'}
+
+【短期记忆】
+${short || '无'}
+
+请整理完整细节事实集。`,
+        },
+    ];
+}
+
+async function bootstrapFactsFromMemory() {
+    if (factBootstrapRunning) return false;
+    if (!isDedicatedMode()) {
+        toastr.warning('整理现有记忆需要先启用独立 API 模式');
+        return false;
+    }
+    const data = state();
+    if (!data.short.length && !data.long.length) {
+        toastr.warning('目前没有可整理的长期或短期记忆');
+        return false;
+    }
+    factBootstrapRunning = true;
+    runtimeStatus.captureState = 'working';
+    runtimeStatus.captureText = '捕获：正在从现有记忆整理细节事实';
+    render();
+    try {
+        const { label, text } = await sendDedicatedRequest(
+            buildFactBootstrapRequest(),
+            Math.max(pluginSettings().maxTokens, 1800),
+        );
+        const facts = parseFactLines(text).filter(item => item.action === 'upsert');
+        if (!facts.length) throw new Error('记忆 API 没有返回可用的细节记忆区块');
+        const current = state();
+        current.factSeed = normalizeFactItems(facts.slice(-MAX_FACTS), 'seed');
+        context().chatMetadata[META_KEY] = current;
+        rebuildFromChat();
+        await context().saveChat();
+        activeTab = 'facts';
+        runtimeStatus.captureState = 'success';
+        runtimeStatus.captureText = `捕获：细节整理完成 · 独立 API（${label}）· ${state().facts.length} 条`;
+        toastr.success(`已从现有记忆整理 ${state().facts.length} 条细节事实`);
+        render();
+        return true;
+    } catch (error) {
+        runtimeStatus.captureState = 'error';
+        runtimeStatus.captureText = `捕获：细节整理失败 · ${error.message}`;
+        toastr.error(`细节记忆整理失败：${error.message}`);
+        render();
+        return false;
+    } finally {
+        factBootstrapRunning = false;
+        render();
+    }
+}
+
 function readStoredCapture(message) {
     const stored = message?.extra?.[MESSAGE_META_KEY];
     if (!stored || typeof stored !== 'object') return null;
     const capture = {
         short: Array.isArray(stored.short) ? unique(stored.short) : [],
         long: Array.isArray(stored.long) ? unique(stored.long) : [],
+        facts: normalizeFactOps(stored.facts),
         archiveSourceDigest: String(stored.archiveSourceDigest || ''),
     };
     return hasCapture(capture) ? capture : null;
 }
 
-function writeStoredCapture(message, capture, source, metadata = {}) {
-    message.extra ??= {};
-    const stored = {
+function createStoredCapture(capture, source, metadata = {}) {
+    return {
         short: capture.short,
         long: capture.long,
+        facts: normalizeFactOps(capture.facts),
         source,
         capturedAt: Date.now(),
         ...(metadata.archiveSourceDigest
             ? { archiveSourceDigest: String(metadata.archiveSourceDigest) }
             : {}),
     };
+}
+
+function writeStoredCapture(message, capture, source, metadata = {}) {
+    message.extra ??= {};
+    const stored = createStoredCapture(capture, source, metadata);
     message.extra[MESSAGE_META_KEY] = stored;
 
     const swipeId = Number(message.swipe_id);
@@ -1160,6 +1464,125 @@ function writeStoredCapture(message, capture, source, metadata = {}) {
         message.swipe_info[swipeId].extra ??= {};
         message.swipe_info[swipeId].extra[MESSAGE_META_KEY] = structuredClone(stored);
     }
+}
+
+function writeStoredCaptureToSwipe(message, swipeId, capture, source, metadata = {}) {
+    if (!Number.isInteger(swipeId) || !message?.swipe_info?.[swipeId]) return false;
+    message.swipe_info[swipeId].extra ??= {};
+    if (!message.swipe_info[swipeId].extra[MESSAGE_META_KEY]) {
+        message.swipe_info[swipeId].extra[MESSAGE_META_KEY] = createStoredCapture(
+            capture,
+            source,
+            metadata,
+        );
+    }
+    return true;
+}
+
+function syncCaptureFromCurrentSwipe(message) {
+    const swipeId = Number(message?.swipe_id);
+    if (!Number.isInteger(swipeId) || !message?.swipe_info?.[swipeId]) return;
+    message.extra ??= {};
+    const stored = message.swipe_info[swipeId].extra?.[MESSAGE_META_KEY];
+    if (stored) {
+        message.extra[MESSAGE_META_KEY] = structuredClone(stored);
+    } else {
+        delete message.extra[MESSAGE_META_KEY];
+    }
+}
+
+function messageForSwipe(message, swipeId) {
+    const swipeText = Array.isArray(message?.swipes) ? message.swipes[swipeId] : undefined;
+    if (typeof swipeText !== 'string') return null;
+    return {
+        ...message,
+        mes: swipeText,
+        swipe_id: swipeId,
+    };
+}
+
+function findSwipeByDigest(message, expectedDigest, digestVersion) {
+    if (!expectedDigest || !Array.isArray(message?.swipes)) return -1;
+    for (let swipeId = 0; swipeId < message.swipes.length; swipeId++) {
+        const candidate = messageForSwipe(message, swipeId);
+        if (candidate && messageSnapshotDigest(candidate, digestVersion) === expectedDigest) {
+            return swipeId;
+        }
+    }
+    return -1;
+}
+
+function detachImportedTerminalMemory() {
+    const ctx = context();
+    const data = state();
+    const baseline = data.baseline;
+    const source = normalizeSource(baseline?.source);
+    if (!baseline || baseline.terminalDetached || !source || !baseline.short.length) {
+        return { detached: false, needsCapture: false };
+    }
+
+    const terminalIndex = source.chatMessages - 1;
+    const message = ctx.chat[terminalIndex];
+    if (!message || message.is_user) return { detached: false, needsCapture: false };
+
+    const digestVersion = source.digestVersion || 1;
+    const selectedMatches = messageSnapshotDigest(message, digestVersion) === source.lastMessageDigest;
+    const fullPrefixMatches = source.prefixDigest
+        && chatPrefixDigest(ctx.chat.slice(0, source.chatMessages), digestVersion) === source.prefixDigest;
+    const beforePrefixMatches = source.beforeLastPrefixDigest
+        && chatPrefixDigest(ctx.chat.slice(0, terminalIndex), digestVersion) === source.beforeLastPrefixDigest;
+    const originalSwipeId = findSwipeByDigest(message, source.lastMessageDigest, digestVersion);
+    if (!selectedMatches && !fullPrefixMatches && !beforePrefixMatches && originalSwipeId < 0) {
+        return { detached: false, needsCapture: false };
+    }
+
+    const terminalMemory = baseline.short.at(-1);
+    const terminalSourceTurn = Number(terminalMemory?.sourceTurn) || 0;
+    const terminalFacts = terminalSourceTurn
+        ? baseline.facts.filter(item => Number(item.sourceTurn) === terminalSourceTurn)
+        : [];
+    const capture = {
+        short: [terminalMemory.content],
+        long: [],
+        facts: terminalFacts.map(item => ({
+            action: 'upsert',
+            category: item.category,
+            key: item.key,
+            content: item.content,
+            updatedAt: item.updatedAt,
+        })),
+    };
+
+    if (selectedMatches || fullPrefixMatches) {
+        if (!readStoredCapture(message)) {
+            writeStoredCapture(message, capture, '导入旧档末轮');
+        }
+    } else if (originalSwipeId >= 0) {
+        writeStoredCaptureToSwipe(message, originalSwipeId, capture, '导入旧档末轮');
+    }
+
+    baseline.short.pop();
+    if (terminalFacts.length) {
+        const detachedIds = new Set(terminalFacts.map(item => item.id));
+        baseline.facts = baseline.facts.filter(item => !detachedIds.has(item.id));
+    }
+    baseline.source = createSourceSnapshot(ctx.chat, terminalIndex);
+    baseline.terminalDetached = true;
+    data.baseline = baseline;
+    ctx.chatMetadata[META_KEY] = data;
+    ctx.saveMetadataDebounced();
+
+    syncCaptureFromCurrentSwipe(message);
+    const needsCapture = !readStoredCapture(message);
+    if (needsCapture) {
+        runtimeStatus.captureState = 'warning';
+        runtimeStatus.captureText = '捕获：旧档末轮已接管；请点“重试本轮”生成当前 swipe 的新记忆';
+    }
+    return {
+        detached: true,
+        needsCapture,
+        messageIndex: terminalIndex,
+    };
 }
 
 function clearStoredCapture(message) {
@@ -1175,13 +1598,14 @@ function captureMessage(messageIndex, generationType) {
     const ctx = context();
     const message = ctx.chat[messageIndex];
     if (!message || message.is_user) return false;
+    detachImportedTerminalMemory();
 
     const streamCapture = extractCapture(rawStreamText);
     const chatCapture = extractCapture(message.mes);
     const capture = hasCapture(streamCapture) ? streamCapture : chatCapture;
     const source = hasCapture(streamCapture) ? '生成原文' : '聊天文本';
 
-    if (!hasCapture(capture)) {
+    if (!capture.short.length) {
         if (generationType === 'swipe' || generationType === 'regenerate') {
             clearStoredCapture(message);
         }
@@ -1206,7 +1630,7 @@ function captureMessage(messageIndex, generationType) {
             : '',
     });
     runtimeStatus.captureState = 'success';
-    runtimeStatus.captureText = `捕获：成功 · ${source} · 短期 ${capture.short.length} / 长期 ${capture.long.length}`;
+    runtimeStatus.captureText = `捕获：成功 · ${source} · 短期 ${capture.short.length} / 长期 ${capture.long.length} / 细节 ${capture.facts.length}`;
     return true;
 }
 
@@ -1214,7 +1638,10 @@ function buildStateFromChat(endExclusive = context().chat.length) {
     const ctx = context();
     const rebuilt = emptyState();
     const end = clamp(Number(endExclusive) || 0, 0, ctx.chat.length);
-    const baseline = normalizeBaseline(ctx.chatMetadata?.[META_KEY]?.baseline);
+    const previousState = ctx.chatMetadata?.[META_KEY];
+    const baseline = normalizeBaseline(previousState?.baseline);
+    rebuilt.factSeed = normalizeFactItems(previousState?.factSeed, 'seed');
+    rebuilt.manualFacts = normalizeFactOps(previousState?.manualFacts);
     let startIndex = 0;
     if (baseline) {
         const boundary = resolveBaselineBoundary(baseline, ctx.chat, end);
@@ -1222,9 +1649,21 @@ function buildStateFromChat(endExclusive = context().chat.length) {
         rebuilt.baselineStatus = boundary.status;
         rebuilt.short = baseline.short.map(item => ({ ...item, origin: 'baseline' }));
         rebuilt.long = baseline.long.map(item => ({ ...item, origin: 'baseline' }));
+        rebuilt.facts = baseline.facts.map(item => ({ ...item, origin: 'baseline' }));
         rebuilt.volumeCount = baseline.volumeCount;
         startIndex = boundary.startIndex;
     }
+    applyFactOps(
+        rebuilt.facts,
+        rebuilt.factSeed.map(item => ({
+            action: 'upsert',
+            category: item.category,
+            key: item.key,
+            content: item.content,
+            updatedAt: item.updatedAt,
+        })),
+        { origin: 'seed' },
+    );
 
     for (let index = startIndex; index < end; index++) {
         const message = ctx.chat[index];
@@ -1232,6 +1671,7 @@ function buildStateFromChat(endExclusive = context().chat.length) {
         const stored = readStoredCapture(message);
         const longs = stored?.long ?? extract(LONG_RE, message.mes);
         const shorts = stored?.short ?? extract(SHORT_RE, message.mes);
+        const facts = stored?.facts ?? parseFactLines(message.mes);
         for (let captureIndex = 0; captureIndex < longs.length; captureIndex++) {
             const content = longs[captureIndex];
             const archiveBatch = rebuilt.short.slice(0, MAX_SHORT);
@@ -1268,8 +1708,13 @@ function buildStateFromChat(endExclusive = context().chat.length) {
                 origin: 'capture',
             });
         }
+        applyFactOps(rebuilt.facts, facts, {
+            messageIndex: index,
+            origin: 'capture',
+        });
     }
     rebuilt.long = rebuilt.long.slice(-MAX_LONG);
+    applyManualFactOps(rebuilt.facts, rebuilt.manualFacts);
     return rebuilt;
 }
 
@@ -1369,35 +1814,84 @@ function renderSettings(panel) {
         : '';
 }
 
+function renderInjectionPreview(panel) {
+    const textarea = panel.querySelector('#ksm-injection-text');
+    const meta = panel.querySelector('#ksm-injection-meta');
+    if (!textarea || !meta || !injectionPreviewOpen) return;
+    const ctx = context();
+    const currentPayload = ctx.chatId ? buildPayload() : '';
+    const preparedForCurrentChat = runtimeStatus.preparedChatId === String(ctx.chatId || '')
+        && runtimeStatus.preparedAt
+        && runtimeStatus.preparedPayload;
+    const payload = preparedForCurrentChat ? runtimeStatus.preparedPayload : currentPayload;
+    const registered = ctx.extensionPrompts?.[MODULE]?.value === currentPayload;
+    const preparedTime = preparedForCurrentChat
+        ? new Date(runtimeStatus.preparedAt).toLocaleTimeString()
+        : '尚未生成';
+    const sourceLabel = preparedForCurrentChat ? '最近一次生成前实际登记' : '当前待发送';
+    meta.textContent = `${sourceLabel} · 酒馆当前登记：${registered ? '成功' : '未确认'} · user 层 depth 0 · ${payload.length} 字 · 时间：${preparedTime}`;
+    textarea.value = payload;
+}
+
+async function copyInjectionPreview() {
+    const textarea = document.getElementById('ksm-injection-text');
+    if (!textarea) return;
+    try {
+        await navigator.clipboard.writeText(textarea.value);
+    } catch {
+        textarea.focus();
+        textarea.select();
+        document.execCommand('copy');
+    }
+    toastr.success('已复制本轮实际登记的记忆提示词');
+}
+
 function render() {
     const panel = document.getElementById('ksm-panel');
     if (!panel) return;
     const data = state();
     panel.classList.toggle('ksm-open', panelOpen);
     panel.classList.toggle('ksm-settings-open', settingsOpen);
+    panel.classList.toggle('ksm-preview-open', injectionPreviewOpen);
     panel.querySelector('[data-tab="short"]').classList.toggle('active', activeTab === 'short');
     panel.querySelector('[data-tab="long"]').classList.toggle('active', activeTab === 'long');
+    panel.querySelector('[data-tab="facts"]').classList.toggle('active', activeTab === 'facts');
     panel.querySelector('#ksm-short-count').textContent = `${data.short.length}/${MAX_SHORT}`;
     panel.querySelector('#ksm-long-count').textContent = `${data.long.length}/${MAX_LONG}`;
+    panel.querySelector('#ksm-fact-count').textContent = `${data.facts.length}/${MAX_FACTS}`;
     const injectionStatus = panel.querySelector('[data-status="injection"]');
     const captureStatus = panel.querySelector('[data-status="capture"]');
     injectionStatus.dataset.state = runtimeStatus.injectionState;
     captureStatus.dataset.state = runtimeStatus.captureState;
     injectionStatus.querySelector('span:last-child').textContent = runtimeStatus.injectionText;
     captureStatus.querySelector('span:last-child').textContent = runtimeStatus.captureText;
-    const items = activeTab === 'short' ? data.short : data.long;
+    const bootstrapButton = panel.querySelector('[data-action="bootstrap-facts"]');
+    if (bootstrapButton) {
+        bootstrapButton.disabled = factBootstrapRunning;
+        bootstrapButton.textContent = factBootstrapRunning ? '整理中…' : '整理细节';
+    }
+    const items = activeTab === 'short'
+        ? data.short
+        : (activeTab === 'long' ? data.long : data.facts);
     panel.querySelector('#ksm-list').innerHTML = items.length
         ? items.map(item => `
             <article class="ksm-item" data-id="${escapeHtml(item.id)}">
-                <header>${escapeHtml(item.label || `短期记忆 ${data.short.indexOf(item) + 1}`)}</header>
+                <header>${escapeHtml(
+                    activeTab === 'facts'
+                        ? `${item.category} · ${item.key}`
+                        : (item.label || `短期记忆 ${data.short.indexOf(item) + 1}`),
+                )}</header>
                 <textarea>${escapeHtml(item.content)}</textarea>
                 <div class="ksm-item-actions">
                     <button data-action="save-item">保存</button>
                     <button data-action="delete-item">删除</button>
                 </div>
             </article>`).join('')
-        : '<div class="ksm-empty">这里还没有记忆。</div>';
+        : (activeTab === 'facts'
+            ? '<div class="ksm-empty">这里还没有细节事实。点底部“整理细节”，可从现有长期与短期记忆自动建立。</div>'
+            : '<div class="ksm-empty">这里还没有记忆。</div>');
     renderSettings(panel);
+    renderInjectionPreview(panel);
 }
 
 function syncCaptureToCurrentSwipe(message) {
@@ -1438,7 +1932,7 @@ function persistMemoryItemChange(item, kind, action, nextContent = '') {
         if (index < 0) return false;
         if (action === 'save') list[index] = clean(nextContent);
         if (action === 'delete') list.splice(index, 1);
-        if (!stored.short?.length && !stored.long?.length) {
+        if (!stored.short?.length && !stored.long?.length && !stored.facts?.length) {
             delete message.extra[MESSAGE_META_KEY];
         }
         syncCaptureToCurrentSwipe(message);
@@ -1448,6 +1942,29 @@ function persistMemoryItemChange(item, kind, action, nextContent = '') {
     }
 
     return false;
+}
+
+function persistFactChange(item, action, nextContent = '') {
+    const ctx = context();
+    const data = state();
+    const category = normalizeFactCategory(item.category);
+    const key = normalizeFactKey(item.key);
+    const content = clean(nextContent).slice(0, MAX_FACT_CONTENT_LENGTH);
+    if (!key || (action === 'save' && !content)) return false;
+    const id = factId(category, key);
+    data.manualFacts = normalizeFactOps(data.manualFacts)
+        .filter(operation => factId(operation.category, operation.key) !== id);
+    data.manualFacts.push({
+        action: action === 'delete' ? 'delete' : 'upsert',
+        category,
+        key,
+        content: action === 'delete' ? '' : content,
+        updatedAt: Date.now(),
+    });
+    ctx.chatMetadata[META_KEY] = data;
+    rebuildFromChat();
+    void ctx.saveChat();
+    return true;
 }
 
 function downloadJson() {
@@ -1462,11 +1979,20 @@ function downloadJson() {
         if (item.sourceTurn) exported.sourceTurn = item.sourceTurn;
         return exported;
     };
+    const exportFact = item => ({
+        id: item.id,
+        category: item.category,
+        key: item.key,
+        content: item.content,
+        updatedAt: item.updatedAt,
+        ...(item.sourceTurn ? { sourceTurn: item.sourceTurn } : {}),
+    });
     const exported = {
         version: STATE_VERSION,
         format: 'krystal-scroll-memory',
         short: data.short.map(exportItem),
         long: data.long.map(exportItem),
+        facts: data.facts.map(exportFact),
         volumeCount: data.volumeCount,
         source: createSourceSnapshot(context().chat),
         exportedAt: Date.now(),
@@ -1487,9 +2013,19 @@ function importJson(file) {
             const parsed = JSON.parse(String(reader.result));
             if (!Array.isArray(parsed.short) || !Array.isArray(parsed.long)) throw new Error('格式不正确');
             const ctx = context();
+            const importedFacts = Array.isArray(parsed.facts)
+                ? parsed.facts
+                : (Array.isArray(parsed.notes?.corrections)
+                    ? parsed.notes.corrections.map((content, index) => ({
+                        category: '其他',
+                        key: `导入修正 ${index + 1}`,
+                        content,
+                    }))
+                    : []);
             const baseline = normalizeBaseline({
                 short: parsed.short,
                 long: parsed.long,
+                facts: importedFacts,
                 volumeCount: parsed.volumeCount,
                 source: normalizeSource(parsed.source) || createSourceSnapshot(ctx.chat),
                 importedAt: Date.now(),
@@ -1499,13 +2035,14 @@ function importJson(file) {
                 ...emptyState(),
                 baseline,
             };
+            detachImportedTerminalMemory();
             rebuildFromChat();
             void ctx.saveChat();
             const data = state();
             if (data.baselineStatus === 'stale') {
                 toastr.warning('旧档已导入，但原聊天楼层与导出时不同；请重新导出旧档后再生成一次');
             } else {
-                toastr.success(`旧档已固定导入，并合并当前聊天的新记忆（短期 ${data.short.length} / 长期 ${data.long.length}）`);
+                toastr.success(`旧档已固定导入，并接管末轮重说（短期 ${data.short.length} / 长期 ${data.long.length} / 细节 ${data.facts.length}）`);
             }
         } catch (error) {
             toastr.error(`导入失败：${error.message}`);
@@ -1529,6 +2066,8 @@ async function retryLastCapture() {
         toastr.warning('当前聊天还没有可整理的 AI 回复');
         return;
     }
+    const detached = detachImportedTerminalMemory();
+    if (detached.detached) rebuildFromChat();
     if (isDedicatedMode()) {
         await queueProfileCapture(messageIndex);
         return;
@@ -1560,6 +2099,7 @@ function mountUi() {
             <nav class="ksm-tabs">
                 <button data-tab="short">短期 <span id="ksm-short-count">0/20</span></button>
                 <button data-tab="long">长期 <span id="ksm-long-count">0/30</span></button>
+                <button data-tab="facts">细节 <span id="ksm-fact-count">0/${MAX_FACTS}</span></button>
             </nav>
             <section class="ksm-status" aria-live="polite">
                 <div data-status="injection" data-state="idle"><span class="ksm-status-dot"></span><span>注入：等待选择聊天</span></div>
@@ -1613,6 +2153,9 @@ function mountUi() {
                 <p class="ksm-setting-help ksm-setting-help-wide">
                     默认是原 Mufy 的短期与长期总结规则，可自行修改。“记什么、怎么概括”由这里控制；边界标签和第 21 轮归档仍由插件固定保护。
                 </p>
+                <p class="ksm-setting-help ksm-setting-help-wide">
+                    细节事实层会另外维护人物关系、秘密与知情边界、物品地点、承诺日期、身体习惯及未解线索；同一稳定键发生变化时覆盖旧值，不重复堆叠。
+                </p>
                 <label class="ksm-setting-row">
                     <span>最大输出</span>
                     <input id="ksm-max-tokens" type="number" min="${MIN_MAX_TOKENS}" max="${MAX_MAX_TOKENS}" step="100" inputmode="numeric">
@@ -1623,9 +2166,23 @@ function mountUi() {
                     <button data-action="test-profile">测试连接</button>
                 </div>
             </section>
+            <section id="ksm-injection-preview" aria-label="实际注入内容">
+                <h3>本轮实际注入</h3>
+                <p id="ksm-injection-meta" class="ksm-preview-meta"></p>
+                <textarea id="ksm-injection-text" readonly spellcheck="false"></textarea>
+                <p class="ksm-setting-help ksm-setting-help-wide">
+                    “酒馆登记成功”证明这段内容已交给提示词系统；生成后仍可在 Prompt Itemization 中搜索“历史记忆-开始”，确认最终请求没有被上下文裁剪。模型是否真正采用，只能再用剧情细节进行行为验证。
+                </p>
+                <div class="ksm-settings-actions">
+                    <button data-action="copy-injection">复制</button>
+                    <button data-action="close-injection">返回</button>
+                </div>
+            </section>
             <footer class="ksm-footer">
                 <button data-action="rebuild">从当前聊天重建</button>
                 <button data-action="retry-last">重试本轮</button>
+                <button data-action="bootstrap-facts">整理细节</button>
+                <button data-action="view-injection">查看注入</button>
                 <button data-action="export">导出</button>
                 <label>导入<input id="ksm-import" type="file" accept=".json,application/json"></label>
             </footer>
@@ -1641,12 +2198,22 @@ function mountUi() {
         if (!button) return;
         if (button.dataset.tab) {
             activeTab = button.dataset.tab;
+            injectionPreviewOpen = false;
             render();
             return;
         }
         const action = button.dataset.action;
         if (action === 'close') panelOpen = false;
-        if (action === 'settings') settingsOpen = !settingsOpen;
+        if (action === 'settings') {
+            settingsOpen = !settingsOpen;
+            injectionPreviewOpen = false;
+        }
+        if (action === 'view-injection') {
+            settingsOpen = false;
+            injectionPreviewOpen = true;
+        }
+        if (action === 'close-injection') injectionPreviewOpen = false;
+        if (action === 'copy-injection') void copyInjectionPreview();
         if (action === 'export') downloadJson();
         if (action === 'save-settings') {
             runtimeStatus.captureState = 'working';
@@ -1661,19 +2228,28 @@ function mountUi() {
         if (action === 'restore-default-instruction') restoreDefaultMemoryInstruction();
         if (action === 'test-profile') void testProfileConnection();
         if (action === 'retry-last') void retryLastCapture();
+        if (action === 'bootstrap-facts') void bootstrapFactsFromMemory();
         if (action === 'rebuild' && confirm('将根据当前聊天中保存的记忆标签重建侧栏，继续吗？')) rebuildFromChat();
         if (action === 'save-item' || action === 'delete-item') {
             const article = button.closest('.ksm-item');
             const data = state();
-            const list = activeTab === 'short' ? data.short : data.long;
+            const list = activeTab === 'short'
+                ? data.short
+                : (activeTab === 'long' ? data.long : data.facts);
             const index = list.findIndex(item => item.id === article.dataset.id);
             if (index >= 0) {
-                const persisted = persistMemoryItemChange(
-                    list[index],
-                    activeTab,
-                    action === 'save-item' ? 'save' : 'delete',
-                    article.querySelector('textarea').value,
-                );
+                const persisted = activeTab === 'facts'
+                    ? persistFactChange(
+                        list[index],
+                        action === 'save-item' ? 'save' : 'delete',
+                        article.querySelector('textarea').value,
+                    )
+                    : persistMemoryItemChange(
+                        list[index],
+                        activeTab,
+                        action === 'save-item' ? 'save' : 'delete',
+                        article.querySelector('textarea').value,
+                    );
                 if (!persisted) {
                     toastr.warning('这条记忆来自未迁移的旧标签，暂时无法持久修改');
                 }
@@ -1751,6 +2327,8 @@ function registerEvents() {
         events.CONNECTION_PROFILE_DELETED,
     ].filter(Boolean).forEach(event => ctx.eventSource.on(event, render));
     ctx.eventSource.on(events.CHAT_CHANGED, () => {
+        const detached = detachImportedTerminalMemory();
+        if (detached.detached) rebuildFromChat();
         updateInjection();
         render();
         window.setTimeout(hideAllMemoryBlocks, 50);
@@ -1758,13 +2336,17 @@ function registerEvents() {
     if (events.GENERATION_AFTER_COMMANDS) {
         ctx.eventSource.on(events.GENERATION_AFTER_COMMANDS, (generationType, _options, dryRun) => {
             if (dryRun || generationType === 'quiet' || generationType === 'impersonate') return;
+            if (generationType === 'swipe' || generationType === 'regenerate') {
+                const detached = detachImportedTerminalMemory();
+                if (detached.detached) rebuildFromChat();
+            }
             rawStreamText = '';
             trackRawStream = !isDedicatedMode();
             runtimeStatus.captureState = 'working';
             runtimeStatus.captureText = isDedicatedMode()
                 ? '捕获：等待正文完成后调用独立 API'
                 : '捕获：等待本轮 AI 回复';
-            updateInjection();
+            updateInjection({ markPrepared: true });
         });
     }
     if (events.STREAM_TOKEN_RECEIVED) {
@@ -1789,7 +2371,27 @@ function registerEvents() {
         trackRawStream = false;
         rawStreamText = '';
     });
-    [events.MESSAGE_SWIPED, events.MESSAGE_DELETED, events.MESSAGE_UPDATED]
+    if (events.MESSAGE_SWIPED) {
+        ctx.eventSource.on(events.MESSAGE_SWIPED, (messageIndex, meta = {}) => {
+            const detached = detachImportedTerminalMemory();
+            const numericIndex = Number(messageIndex);
+            const index = Number.isInteger(numericIndex) ? numericIndex : latestAssistantMessageIndex();
+            const message = context().chat[index];
+            if (message && !message.is_user) syncCaptureFromCurrentSwipe(message);
+            rebuildFromChat();
+            window.setTimeout(hideAllMemoryBlocks, 50);
+            if (!meta?.pendingGeneration
+                && isDedicatedMode()
+                && message
+                && !message.is_user
+                && !readStoredCapture(message)) {
+                void queueProfileCapture(index);
+            } else if (detached.needsCapture && !meta?.pendingGeneration && isDedicatedMode()) {
+                void queueProfileCapture(detached.messageIndex);
+            }
+        });
+    }
+    [events.MESSAGE_DELETED, events.MESSAGE_UPDATED]
         .filter(Boolean)
         .forEach(event => ctx.eventSource.on(event, () => {
             rebuildFromChat();
@@ -1797,6 +2399,8 @@ function registerEvents() {
         }));
     if (events.MESSAGE_EDITED) {
         ctx.eventSource.on(events.MESSAGE_EDITED, messageIndex => {
+            const detached = detachImportedTerminalMemory();
+            if (detached.detached) rebuildFromChat();
             const message = context().chat[Number(messageIndex)];
             if (message && !message.is_user) clearStoredCapture(message);
             runtimeStatus.captureState = 'idle';
@@ -1817,6 +2421,8 @@ function init() {
     initialized = true;
     mountUi();
     registerEvents();
+    const detached = detachImportedTerminalMemory();
+    if (detached.detached) rebuildFromChat();
     updateInjection();
     render();
     window.setTimeout(hideAllMemoryBlocks, 100);
