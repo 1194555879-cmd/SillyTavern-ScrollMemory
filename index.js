@@ -8,9 +8,13 @@ const MODULE = 'krystal_scroll_memory';
 const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
-const VERSION = '0.1.6';
+const SETTINGS_KEY = 'krystalScrollMemory';
+const VERSION = '0.2.0';
 const MAX_SHORT = 20;
 const MAX_LONG = 30;
+const DEFAULT_MAX_TOKENS = 900;
+const MIN_MAX_TOKENS = 200;
+const MAX_MAX_TOKENS = 4000;
 const LAUNCHER_MARGIN = 8;
 const LAUNCHER_DRAG_THRESHOLD = 6;
 const SHORT_RE = /【记忆条目】([\s\S]{1,1200}?)【记忆完】/g;
@@ -26,14 +30,21 @@ const BAD_PATTERNS = [
 
 let panelOpen = false;
 let activeTab = 'short';
+let settingsOpen = false;
 let initialized = false;
 let trackRawStream = false;
 let rawStreamText = '';
+let captureQueue = Promise.resolve();
 const runtimeStatus = {
     injectionState: 'idle',
     injectionText: '注入：等待选择聊天',
     captureState: 'idle',
     captureText: '捕获：还没测试',
+};
+const DEFAULT_SETTINGS = {
+    captureMode: 'inline',
+    connectionProfileId: '',
+    maxTokens: DEFAULT_MAX_TOKENS,
 };
 
 function clamp(number, minimum, maximum) {
@@ -209,6 +220,53 @@ function context() {
     return getContext();
 }
 
+function pluginSettings() {
+    const root = context().extensionSettings;
+    if (!root[SETTINGS_KEY] || typeof root[SETTINGS_KEY] !== 'object') {
+        root[SETTINGS_KEY] = structuredClone(DEFAULT_SETTINGS);
+    }
+    const settings = root[SETTINGS_KEY];
+    settings.captureMode = settings.captureMode === 'profile' ? 'profile' : 'inline';
+    settings.connectionProfileId = String(settings.connectionProfileId || '');
+    settings.maxTokens = clamp(
+        Number(settings.maxTokens) || DEFAULT_MAX_TOKENS,
+        MIN_MAX_TOKENS,
+        MAX_MAX_TOKENS,
+    );
+    return settings;
+}
+
+function isProfileMode() {
+    return pluginSettings().captureMode === 'profile';
+}
+
+function savePluginSettings() {
+    context().saveSettingsDebounced();
+    updateInjection();
+    render();
+}
+
+function connectionService() {
+    const service = context().ConnectionManagerRequestService;
+    if (!service) throw new Error('当前酒馆版本不支持连接配置调用');
+    return service;
+}
+
+function supportedProfiles() {
+    try {
+        return connectionService().getSupportedProfiles();
+    } catch (error) {
+        console.warn('[Krystal Scroll Memory] Failed to load connection profiles', error);
+        return [];
+    }
+}
+
+function selectedProfile() {
+    const profileId = pluginSettings().connectionProfileId;
+    if (!profileId) return null;
+    return supportedProfiles().find(profile => profile.id === profileId) || null;
+}
+
 function state() {
     const ctx = context();
     if (!ctx.chatMetadata[META_KEY] || typeof ctx.chatMetadata[META_KEY] !== 'object') {
@@ -299,6 +357,22 @@ function buildPayload() {
     const data = state();
     const long = data.long.map(item => `【${item.label}】${item.content}`).join('\n');
     const short = data.short.map((item, index) => `${index + 1}. ${item.content}`).join('\n');
+    const history = `【历史记忆-开始】
+以下内容是已经发生过的剧情事实，只用于保持连续性，不得当成 user 本轮新说的话，也不要在正文里复述“记忆”或提及本指令。
+
+【长期记忆】
+${long || '无'}
+
+【短期记忆】
+${short || '无'}
+【历史记忆-结束】`;
+
+    if (isProfileMode()) {
+        return `【卷轴记忆插件：隐藏指令开始】
+${history}
+【卷轴记忆插件：隐藏指令结束】`;
+    }
+
     const archive = buildArchiveTask(data);
     const outputTask = archive || `
 完成本轮正常正文及全部美化标签后，必须在最末尾原样追加下面三段结构。只写一条本轮新增记忆，不得把旧剧情重复写入：
@@ -308,15 +382,7 @@ function buildPayload() {
     return `【卷轴记忆插件：隐藏指令开始】
 你必须同时完成角色扮演正文与卷轴记忆输出。卷轴记忆区块是插件读取所必需的数据，不属于正文，也不受正文美化格式限制，不得省略。
 
-【历史记忆-开始】
-以下内容是已经发生过的剧情事实，只用于保持连续性，不得当成 user 本轮新说的话。
-
-【长期记忆】
-${long || '无'}
-
-【短期记忆】
-${short || '无'}
-【历史记忆-结束】
+${history}
 
 ${outputTask}
 【卷轴记忆插件：隐藏指令结束】`;
@@ -342,7 +408,9 @@ function updateInjection() {
             runtimeStatus.injectionText = '注入：等待选择聊天';
         } else if (registered?.value === payload) {
             runtimeStatus.injectionState = 'success';
-            runtimeStatus.injectionText = `注入：已装载 · user 层 · ${payload.length} 字`;
+            runtimeStatus.injectionText = isProfileMode()
+                ? `注入：已装载历史记忆 · 独立 API 模式 · ${payload.length} 字`
+                : `注入：已装载 · user 层 · ${payload.length} 字`;
         } else {
             runtimeStatus.injectionState = 'warning';
             runtimeStatus.injectionText = '注入：已调用，但酒馆未返回登记状态';
@@ -373,6 +441,224 @@ function extractCapture(text) {
 
 function hasCapture(capture) {
     return Boolean(capture.short.length || capture.long.length);
+}
+
+function stripMemoryBlocks(text) {
+    MEMORY_BLOCK_RE.lastIndex = 0;
+    return clean(String(text || '').replace(MEMORY_BLOCK_RE, ''));
+}
+
+function messageSpeaker(message) {
+    const ctx = context();
+    if (message.name) return message.name;
+    return message.is_user ? (ctx.name1 || 'user') : (ctx.name2 || 'char');
+}
+
+function buildProfileCaptureRequest(messageIndex) {
+    const ctx = context();
+    const data = buildStateFromChat(messageIndex);
+    const archiveRequired = data.short.length >= MAX_SHORT;
+    let turnStart = 0;
+    for (let index = messageIndex - 1; index >= 0; index--) {
+        const candidate = ctx.chat[index];
+        if (candidate && !candidate.is_user && !candidate.is_system) {
+            turnStart = index + 1;
+            break;
+        }
+    }
+    const formatMessages = messages => messages
+        .filter(message => message && !message.is_system)
+        .map(message => {
+            const role = message.is_user ? 'user' : 'assistant';
+            const content = stripMemoryBlocks(message.mes).slice(-16000);
+            return `【${role}｜${messageSpeaker(message)}】\n${content}`;
+        })
+        .join('\n\n');
+    const referenceMessages = formatMessages(
+        ctx.chat.slice(Math.max(0, turnStart - 4), turnStart),
+    );
+    const currentTurn = formatMessages(ctx.chat.slice(turnStart, messageIndex + 1));
+
+    const memoryContext = (archiveRequired ? data.short : data.short.slice(-6))
+        .map((item, index) => `${index + 1}. ${item.content}`)
+        .join('\n');
+
+    const outputFormat = archiveRequired
+        ? `你必须按顺序输出且只输出以下两个区块：
+【长期记忆条目】
+把“待归档短期记忆”中的 20 条压缩成一条长期记忆
+【长期记忆完】
+【记忆条目】
+只总结“本轮对话”中新发生的剧情事实
+【记忆完】`
+        : `你必须只输出以下区块：
+【记忆条目】
+只总结“本轮对话”中新发生的剧情事实
+【记忆完】`;
+
+    const systemPrompt = `你是独立的剧情记忆整理器，不参与角色扮演，也绝不续写剧情。
+把对话压缩成客观、清晰、可供下一轮调用的事实记忆。
+
+规则：
+1. 准确区分 user 与角色的言行、想法和所属物品，禁止张冠李戴。
+2. 保留人物姓名、地点、具体物品、关系变化、承诺、冲突、伏笔和长期目标。
+3. 使用明确的主谓宾句式；禁止文学化、气氛概括、评价和推测。
+4. 同一区块内的多个事实使用真实换行，不要输出 <br> 或任何 HTML。
+5. 不要复述旧记忆，不要解释任务，不要使用 Markdown 代码块。
+
+${outputFormat}`;
+
+    const userPrompt = `【人物标识】
+user：${ctx.name1 || 'user'}
+主要角色：${ctx.name2 || 'char'}
+
+${archiveRequired ? '【待归档短期记忆】' : '【最近短期记忆，仅用于去重与指代判断】'}
+${memoryContext || '无'}
+
+【本轮对话】
+${currentTurn || '无'}
+
+【前文参考，仅用于判断指代，禁止重复总结】
+${referenceMessages || '无'}
+
+请严格按指定边界标签输出。`;
+
+    return {
+        archiveRequired,
+        messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+        ],
+    };
+}
+
+function captureFromApiResponse(text) {
+    const tagged = extractCapture(text);
+    if (hasCapture(tagged)) return tagged;
+
+    const candidate = String(text || '')
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+    try {
+        const parsed = JSON.parse(candidate);
+        return {
+            short: unique(Array.isArray(parsed.short) ? parsed.short : [parsed.short || parsed.memory]),
+            long: unique(Array.isArray(parsed.long) ? parsed.long : [parsed.long || parsed.archive]),
+        };
+    } catch {
+        return tagged;
+    }
+}
+
+async function sendProfileRequest(messages, maxTokens = pluginSettings().maxTokens) {
+    const profile = selectedProfile();
+    if (!profile) throw new Error('请先选择一个可用的记忆 API 连接配置');
+    const service = connectionService();
+    const prompt = service.constructPrompt(messages, profile.id);
+    const response = await service.sendRequest(
+        profile.id,
+        prompt,
+        maxTokens,
+        {
+            stream: false,
+            extractData: true,
+            includePreset: true,
+            includeInstruct: true,
+        },
+    );
+    const text = typeof response === 'string'
+        ? response
+        : response?.content ?? response?.text ?? '';
+    if (!String(text).trim()) throw new Error('记忆 API 返回了空内容');
+    return { profile, text: String(text) };
+}
+
+async function captureMessageWithProfile(messageIndex, snapshot) {
+    const current = context();
+    const message = current.chat[messageIndex];
+    if (!message || message.is_user || message.is_system) return false;
+    if (current.chatId !== snapshot.chatId
+        || String(message.mes || '') !== snapshot.messageText
+        || Number(message.swipe_id || 0) !== snapshot.swipeId) {
+        return false;
+    }
+
+    runtimeStatus.captureState = 'working';
+    runtimeStatus.captureText = '捕获：独立 API 正在整理本轮记忆';
+    render();
+
+    try {
+        const request = buildProfileCaptureRequest(messageIndex);
+        const { profile, text } = await sendProfileRequest(request.messages);
+        const latest = context();
+        const latestMessage = latest.chat[messageIndex];
+        if (latest.chatId !== snapshot.chatId
+            || !latestMessage
+            || String(latestMessage.mes || '') !== snapshot.messageText
+            || Number(latestMessage.swipe_id || 0) !== snapshot.swipeId) {
+            runtimeStatus.captureState = 'warning';
+            runtimeStatus.captureText = '捕获：对话或重说已变化，本次结果已丢弃';
+            render();
+            return false;
+        }
+
+        const capture = captureFromApiResponse(text);
+        if (!capture.short.length) throw new Error('记忆 API 没有返回完整的短期记忆标签');
+        if (request.archiveRequired && !capture.long.length) {
+            throw new Error('短期记忆已满，但记忆 API 没有返回长期归档标签');
+        }
+
+        writeStoredCapture(latestMessage, capture, `独立 API · ${profile.name}`);
+        rebuildFromChat();
+        await latest.saveChat();
+        runtimeStatus.captureState = 'success';
+        runtimeStatus.captureText = `捕获：成功 · 独立 API（${profile.name}）· 短期 ${capture.short.length} / 长期 ${capture.long.length}`;
+        render();
+        return true;
+    } catch (error) {
+        runtimeStatus.captureState = 'error';
+        runtimeStatus.captureText = `捕获：独立 API 失败 · ${error.message}`;
+        console.error('[Krystal Scroll Memory] Dedicated capture failed', error);
+        toastr.error(`卷轴记忆捕获失败：${error.message}`);
+        render();
+        return false;
+    }
+}
+
+function queueProfileCapture(messageIndex) {
+    const ctx = context();
+    const message = ctx.chat[messageIndex];
+    if (!message || message.is_user || message.is_system) return Promise.resolve(false);
+    const snapshot = {
+        chatId: ctx.chatId,
+        messageText: String(message.mes || ''),
+        swipeId: Number(message.swipe_id || 0),
+    };
+    captureQueue = captureQueue
+        .catch(() => false)
+        .then(() => captureMessageWithProfile(messageIndex, snapshot));
+    return captureQueue;
+}
+
+async function testProfileConnection() {
+    runtimeStatus.captureState = 'working';
+    runtimeStatus.captureText = '捕获：正在测试独立 API';
+    render();
+    try {
+        const { profile } = await sendProfileRequest([
+            { role: 'system', content: '这是连接测试。' },
+            { role: 'user', content: '只回复“连接成功”。' },
+        ], 32);
+        runtimeStatus.captureState = 'success';
+        runtimeStatus.captureText = `捕获：独立 API 已就绪 · ${profile.name}`;
+        toastr.success(`记忆 API 连接成功：${profile.name}`);
+    } catch (error) {
+        runtimeStatus.captureState = 'error';
+        runtimeStatus.captureText = `捕获：连接测试失败 · ${error.message}`;
+        toastr.error(`记忆 API 测试失败：${error.message}`);
+    }
+    render();
 }
 
 function readStoredCapture(message) {
@@ -432,16 +718,24 @@ function captureMessage(messageIndex, generationType) {
         return false;
     }
 
+    const archiveRequired = buildStateFromChat(messageIndex).short.length >= MAX_SHORT;
+    if (archiveRequired && !capture.long.length) {
+        runtimeStatus.captureState = 'warning';
+        runtimeStatus.captureText = '捕获：短期记忆已满，但本轮缺少长期归档标签';
+        return false;
+    }
+
     writeStoredCapture(message, capture, source);
     runtimeStatus.captureState = 'success';
     runtimeStatus.captureText = `捕获：成功 · ${source} · 短期 ${capture.short.length} / 长期 ${capture.long.length}`;
     return true;
 }
 
-function rebuildFromChat() {
+function buildStateFromChat(endExclusive = context().chat.length) {
     const ctx = context();
     const rebuilt = emptyState();
-    for (let index = 0; index < ctx.chat.length; index++) {
+    const end = clamp(Number(endExclusive) || 0, 0, ctx.chat.length);
+    for (let index = 0; index < end; index++) {
         const message = ctx.chat[index];
         if (!message || message.is_user || message.is_system) continue;
         const stored = readStoredCapture(message);
@@ -465,6 +759,12 @@ function rebuildFromChat() {
         }
     }
     rebuilt.long = rebuilt.long.slice(-MAX_LONG);
+    return rebuilt;
+}
+
+function rebuildFromChat() {
+    const ctx = context();
+    const rebuilt = buildStateFromChat(ctx.chat.length);
     ctx.chatMetadata[META_KEY] = rebuilt;
     save();
 }
@@ -494,11 +794,39 @@ function escapeHtml(value) {
     })[char]);
 }
 
+function renderSettings(panel) {
+    const settings = pluginSettings();
+    const profiles = supportedProfiles();
+    const mode = panel.querySelector('#ksm-capture-mode');
+    const profile = panel.querySelector('#ksm-profile');
+    const maxTokens = panel.querySelector('#ksm-max-tokens');
+    const testButton = panel.querySelector('[data-action="test-profile"]');
+    const profileExists = profiles.some(item => item.id === settings.connectionProfileId);
+
+    mode.value = settings.captureMode;
+    profile.innerHTML = [
+        '<option value="">请选择记忆 API 连接配置</option>',
+        ...profiles.map(item => {
+            const detail = item.model ? ` · ${item.model}` : '';
+            return `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}${escapeHtml(detail)}</option>`;
+        }),
+        ...(!profileExists && settings.connectionProfileId
+            ? [`<option value="${escapeHtml(settings.connectionProfileId)}">原连接已不可用，请重新选择</option>`]
+            : []),
+    ].join('');
+    profile.value = settings.connectionProfileId;
+    profile.disabled = settings.captureMode !== 'profile';
+    maxTokens.value = String(settings.maxTokens);
+    maxTokens.disabled = settings.captureMode !== 'profile';
+    testButton.disabled = settings.captureMode !== 'profile' || !profileExists;
+}
+
 function render() {
     const panel = document.getElementById('ksm-panel');
     if (!panel) return;
     const data = state();
     panel.classList.toggle('ksm-open', panelOpen);
+    panel.classList.toggle('ksm-settings-open', settingsOpen);
     panel.querySelector('[data-tab="short"]').classList.toggle('active', activeTab === 'short');
     panel.querySelector('[data-tab="long"]').classList.toggle('active', activeTab === 'long');
     panel.querySelector('#ksm-short-count').textContent = `${data.short.length}/${MAX_SHORT}`;
@@ -521,6 +849,7 @@ function render() {
                 </div>
             </article>`).join('')
         : '<div class="ksm-empty">这里还没有记忆。</div>';
+    renderSettings(panel);
 }
 
 function downloadJson() {
@@ -549,6 +878,37 @@ function importJson(file) {
     reader.readAsText(file);
 }
 
+function latestAssistantMessageIndex() {
+    const chat = context().chat;
+    for (let index = chat.length - 1; index >= 0; index--) {
+        const message = chat[index];
+        if (message && !message.is_user && !message.is_system) return index;
+    }
+    return -1;
+}
+
+async function retryLastCapture() {
+    const messageIndex = latestAssistantMessageIndex();
+    if (messageIndex < 0) {
+        toastr.warning('当前聊天还没有可整理的 AI 回复');
+        return;
+    }
+    if (isProfileMode()) {
+        await queueProfileCapture(messageIndex);
+        return;
+    }
+    const captured = captureMessage(messageIndex, 'retry');
+    if (captured) {
+        rebuildFromChat();
+        await context().saveChat();
+        render();
+        toastr.success('已重新捕获最后一轮记忆');
+    } else {
+        render();
+        toastr.warning('最后一轮回复中没有找到完整记忆标签');
+    }
+}
+
 function mountUi() {
     if (document.getElementById('ksm-launcher')) return;
     document.body.insertAdjacentHTML('beforeend', `
@@ -556,7 +916,10 @@ function mountUi() {
         <div id="ksm-panel" role="dialog" aria-label="卷轴记忆">
             <header class="ksm-title">
                 <div><strong>Krystal · 卷轴记忆</strong><small>v${VERSION}</small></div>
-                <button data-action="close" title="关闭">×</button>
+                <div class="ksm-title-actions">
+                    <button data-action="settings" title="记忆 API 设置" aria-label="记忆 API 设置">⚙</button>
+                    <button data-action="close" title="关闭" aria-label="关闭">×</button>
+                </div>
             </header>
             <nav class="ksm-tabs">
                 <button data-tab="short">短期 <span id="ksm-short-count">0/20</span></button>
@@ -567,8 +930,36 @@ function mountUi() {
                 <div data-status="capture" data-state="idle"><span class="ksm-status-dot"></span><span>捕获：还没测试</span></div>
             </section>
             <section id="ksm-list"></section>
+            <section id="ksm-settings" aria-label="记忆 API 设置">
+                <h3>记忆生成方式</h3>
+                <label class="ksm-setting-row">
+                    <span>工作模式</span>
+                    <select id="ksm-capture-mode">
+                        <option value="inline">正文模型兼容模式</option>
+                        <option value="profile">独立 API（推荐）</option>
+                    </select>
+                </label>
+                <p class="ksm-setting-help">
+                    独立 API 模式下，正文模型只负责演剧情；回复完成后，由另一条连接单独整理记忆。
+                </p>
+                <label class="ksm-setting-row">
+                    <span>记忆 API</span>
+                    <select id="ksm-profile"></select>
+                </label>
+                <p class="ksm-setting-help">
+                    这里读取酒馆的“连接配置”，密钥仍由酒馆保管，不会写进插件或聊天记录。
+                </p>
+                <label class="ksm-setting-row">
+                    <span>最大输出</span>
+                    <input id="ksm-max-tokens" type="number" min="${MIN_MAX_TOKENS}" max="${MAX_MAX_TOKENS}" step="100" inputmode="numeric">
+                </label>
+                <div class="ksm-settings-actions">
+                    <button data-action="test-profile">测试连接</button>
+                </div>
+            </section>
             <footer class="ksm-footer">
                 <button data-action="rebuild">从当前聊天重建</button>
+                <button data-action="retry-last">重试本轮</button>
                 <button data-action="export">导出</button>
                 <label>导入<input id="ksm-import" type="file" accept=".json,application/json"></label>
             </footer>
@@ -589,7 +980,10 @@ function mountUi() {
         }
         const action = button.dataset.action;
         if (action === 'close') panelOpen = false;
+        if (action === 'settings') settingsOpen = !settingsOpen;
         if (action === 'export') downloadJson();
+        if (action === 'test-profile') void testProfileConnection();
+        if (action === 'retry-last') void retryLastCapture();
         if (action === 'rebuild' && confirm('将根据当前聊天中保存的记忆标签重建侧栏，继续吗？')) rebuildFromChat();
         if (action === 'save-item' || action === 'delete-item') {
             const article = button.closest('.ksm-item');
@@ -602,6 +996,38 @@ function mountUi() {
         }
         render();
     });
+    document.getElementById('ksm-panel').addEventListener('change', event => {
+        const settings = pluginSettings();
+        if (event.target.id === 'ksm-capture-mode') {
+            settings.captureMode = event.target.value === 'profile' ? 'profile' : 'inline';
+            if (settings.captureMode === 'profile') {
+                runtimeStatus.captureState = settings.connectionProfileId ? 'idle' : 'warning';
+                runtimeStatus.captureText = settings.connectionProfileId
+                    ? '捕获：独立 API 已配置，等待下一轮'
+                    : '捕获：请先选择记忆 API 连接配置';
+            } else {
+                runtimeStatus.captureState = 'idle';
+                runtimeStatus.captureText = '捕获：正文模型兼容模式，等待下一轮';
+            }
+            savePluginSettings();
+        }
+        if (event.target.id === 'ksm-profile') {
+            settings.connectionProfileId = String(event.target.value || '');
+            runtimeStatus.captureState = settings.connectionProfileId ? 'idle' : 'warning';
+            runtimeStatus.captureText = settings.connectionProfileId
+                ? '捕获：独立 API 已配置，请先测试连接'
+                : '捕获：请先选择记忆 API 连接配置';
+            savePluginSettings();
+        }
+        if (event.target.id === 'ksm-max-tokens') {
+            settings.maxTokens = clamp(
+                Number(event.target.value) || DEFAULT_MAX_TOKENS,
+                MIN_MAX_TOKENS,
+                MAX_MAX_TOKENS,
+            );
+            savePluginSettings();
+        }
+    });
     document.getElementById('ksm-import').addEventListener('change', event => {
         const [file] = event.target.files;
         if (file) importJson(file);
@@ -612,6 +1038,11 @@ function mountUi() {
 function registerEvents() {
     const ctx = context();
     const events = ctx.eventTypes || ctx.event_types;
+    [
+        events.CONNECTION_PROFILE_CREATED,
+        events.CONNECTION_PROFILE_UPDATED,
+        events.CONNECTION_PROFILE_DELETED,
+    ].filter(Boolean).forEach(event => ctx.eventSource.on(event, render));
     ctx.eventSource.on(events.CHAT_CHANGED, () => {
         updateInjection();
         render();
@@ -621,9 +1052,11 @@ function registerEvents() {
         ctx.eventSource.on(events.GENERATION_AFTER_COMMANDS, (generationType, _options, dryRun) => {
             if (dryRun || generationType === 'quiet' || generationType === 'impersonate') return;
             rawStreamText = '';
-            trackRawStream = true;
+            trackRawStream = !isProfileMode();
             runtimeStatus.captureState = 'working';
-            runtimeStatus.captureText = '捕获：等待本轮 AI 回复';
+            runtimeStatus.captureText = isProfileMode()
+                ? '捕获：等待正文完成后调用独立 API'
+                : '捕获：等待本轮 AI 回复';
             updateInjection();
         });
     }
@@ -633,11 +1066,19 @@ function registerEvents() {
         });
     }
     ctx.eventSource.on(events.MESSAGE_RECEIVED, (messageIndex, generationType) => {
+        const index = Number(messageIndex);
+        if (generationType !== 'first_message' && isProfileMode()) {
+            trackRawStream = false;
+            rawStreamText = '';
+            hideMemoryInMessage(index);
+            void queueProfileCapture(index);
+            return;
+        }
         if (generationType !== 'first_message') {
-            captureMessage(Number(messageIndex), generationType);
+            captureMessage(index, generationType);
         }
         rebuildFromChat();
-        hideMemoryInMessage(messageIndex);
+        hideMemoryInMessage(index);
         trackRawStream = false;
         rawStreamText = '';
     });
@@ -652,7 +1093,9 @@ function registerEvents() {
             const message = context().chat[Number(messageIndex)];
             if (message && !message.is_user) clearStoredCapture(message);
             runtimeStatus.captureState = 'idle';
-            runtimeStatus.captureText = '捕获：聊天已编辑，已按当前内容重建';
+            runtimeStatus.captureText = isProfileMode()
+                ? '捕获：聊天已编辑；如需更新记忆，请点“重试本轮”'
+                : '捕获：聊天已编辑，已按当前内容重建';
             rebuildFromChat();
             window.setTimeout(hideAllMemoryBlocks, 50);
         });
