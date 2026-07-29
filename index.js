@@ -10,9 +10,10 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.2.3';
+const VERSION = '0.2.4';
 const STATE_VERSION = 2;
 const SETTINGS_VERSION = 3;
+const SOURCE_DIGEST_VERSION = 2;
 const CUSTOM_SECRET_KEY = 'api_key_custom';
 const DIRECT_SECRET_LABEL = 'Krystal · 卷轴记忆专用 API';
 const MAX_MEMORY_INSTRUCTION_LENGTH = 8000;
@@ -38,13 +39,15 @@ const DEFAULT_MEMORY_INSTRUCTION = `【短期记忆要求】
 2. 把属于同一事件、连续发生或存在因果关系的动作合并成一条连贯记忆；禁止把一个连续事件拆成逐动作、逐姿势的流水账。
 3. 使用简洁、客观的事实陈述，严格写清“谁对谁做了什么，以及产生了什么结果”。
 4. 保留准确的人名、专有名词、具体物品名和具体称呼；不得张冠李戴。
-5. 删除重复动作、寒暄、气氛描写和没有后续价值的细枝末节。
+5. 正文或世界时空栏给出明确剧情日期时，记忆必须以该日期开头；不得把聊天消息的发送时间当成剧情时间，也不得猜测未给出的日期。
+6. 删除重复动作、寒暄、气氛描写和没有后续价值的细枝末节。
 
 【长期记忆要求】
 1. 只总结待归档的 20 条短期记忆，不把本轮新增剧情混入长期记忆，不写卷号。
-2. 不设固定字数限制，必须完整覆盖 20 条记忆中会影响后续剧情的核心事实，不得为了缩短而遗漏重要信息。
-3. 优先保留人物关系变化、重要承诺、未解决冲突、关键道具、具体物品名、重要地点、伏笔、长期目标和称呼变化。
-4. 合并重复内容，删除流水账、重复动作、寒暄及没有长期价值的细节。
+2. 待归档短期记忆含有明确剧情日期时，长期记忆开头必须写明覆盖的起止日期。
+3. 不设固定字数限制，必须完整覆盖 20 条记忆中会影响后续剧情的核心事实，不得为了缩短而遗漏重要信息。
+4. 优先保留人物关系变化、重要承诺、未解决冲突、关键道具、具体物品名、重要地点、伏笔、长期目标和称呼变化。
+5. 合并重复内容，删除流水账、重复动作、寒暄及没有长期价值的细节。
 
 【通用禁则】
 禁止主观推测、评价、形容性扩写、文学化或诗化表达、情绪渲染和象征性总结。`;
@@ -370,21 +373,33 @@ function clean(text) {
         .replace(/\n{3,}/g, '\n\n');
 }
 
-function messageSnapshotText(message) {
-    return [
+function normalizedSendDate(value) {
+    if (value === undefined || value === null || value === '') return '';
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toISOString();
+}
+
+function messageSnapshotText(message, digestVersion = SOURCE_DIGEST_VERSION) {
+    const stableFields = [
         message?.is_user ? 'u' : 'a',
-        String(message?.send_date ?? ''),
         Number(message?.swipe_id || 0),
         String(message?.mes || ''),
+    ];
+    if (digestVersion >= 2) return stableFields.join('␟');
+    return [
+        stableFields[0],
+        normalizedSendDate(message?.send_date),
+        stableFields[1],
+        stableFields[2],
     ].join('␟');
 }
 
-function messageSnapshotDigest(message) {
-    return hash(messageSnapshotText(message));
+function messageSnapshotDigest(message, digestVersion = SOURCE_DIGEST_VERSION) {
+    return hash(messageSnapshotText(message, digestVersion));
 }
 
-function chatPrefixDigest(messages) {
-    return hash(messages.map(messageSnapshotText).join('␞'));
+function chatPrefixDigest(messages, digestVersion = SOURCE_DIGEST_VERSION) {
+    return hash(messages.map(message => messageSnapshotText(message, digestVersion)).join('␞'));
 }
 
 function createSourceSnapshot(chat, requestedCount = chat.length) {
@@ -393,13 +408,14 @@ function createSourceSnapshot(chat, requestedCount = chat.length) {
     const lastMessage = messages.at(-1);
     return {
         kind: 'sillytavern-chat',
+        digestVersion: SOURCE_DIGEST_VERSION,
         chatMessages: messages.length,
         assistantTurns: messages.filter(message => message && !message.is_user).length,
         userTurns: messages.filter(message => message?.is_user).length,
         throughMessageIndex: messages.length - 1,
-        throughSendDate: String(lastMessage?.send_date || ''),
-        prefixDigest: chatPrefixDigest(messages),
-        lastMessageDigest: lastMessage ? messageSnapshotDigest(lastMessage) : '',
+        throughSendDate: normalizedSendDate(lastMessage?.send_date),
+        prefixDigest: chatPrefixDigest(messages, SOURCE_DIGEST_VERSION),
+        lastMessageDigest: lastMessage ? messageSnapshotDigest(lastMessage, SOURCE_DIGEST_VERSION) : '',
     };
 }
 
@@ -409,6 +425,7 @@ function normalizeSource(source) {
     if (!chatMessages) return null;
     return {
         ...source,
+        digestVersion: Math.max(1, Number(source.digestVersion) || 1),
         chatMessages,
         throughMessageIndex: Number.isInteger(Number(source.throughMessageIndex))
             ? Number(source.throughMessageIndex)
@@ -465,15 +482,16 @@ function resolveBaselineBoundary(baseline, chat, endExclusive) {
     if (!source) return { startIndex: endExclusive, status: 'fresh' };
 
     const expectedCount = source.chatMessages;
+    const digestVersion = source.digestVersion || 1;
     if (expectedCount <= endExclusive
         && source.prefixDigest
-        && chatPrefixDigest(chat.slice(0, expectedCount)) === source.prefixDigest) {
+        && chatPrefixDigest(chat.slice(0, expectedCount), digestVersion) === source.prefixDigest) {
         return { startIndex: expectedCount, status: 'fresh' };
     }
 
     if (source.lastMessageDigest) {
         for (let index = Math.min(endExclusive, chat.length) - 1; index >= 0; index--) {
-            if (messageSnapshotDigest(chat[index]) === source.lastMessageDigest) {
+            if (messageSnapshotDigest(chat[index], digestVersion) === source.lastMessageDigest) {
                 return { startIndex: index + 1, status: 'stale' };
             }
         }
@@ -529,6 +547,7 @@ function buildArchiveTask(data) {
 2. 每个区块只能是一条连贯记忆；可以使用真实换行，但不得把连续动作拆成流水账。
 3. 不要输出 <br> 或其他 HTML 标签。
 4. 长期记忆只总结下方 20 条，不把本轮新增事实混入长期记忆；不要写卷号，卷号由插件生成。
+5. 若正文、世界时空栏或短期记忆给出明确剧情日期，短期记忆必须以该日期开头，长期记忆必须写明覆盖的起止日期；不得使用聊天发送时间或猜测日期。
 
 【可编辑的记忆总结要求】
 ${instruction}
@@ -564,7 +583,7 @@ ${history}
     const outputTask = archive || `
 完成本轮正常正文及全部美化标签后，必须在最末尾原样追加下面三段结构。只写一条本轮新增记忆，不得把旧剧情重复写入。下方可编辑要求只控制内容取舍和概括方式，不得更改边界标签或区块数量：
 【记忆条目】
-严格按照下方“记忆总结要求”高度概括本轮新增剧情。这里必须是一条连贯记忆，不得逐动作罗列；不要输出 <br> 或其他 HTML 标签。
+严格按照下方“记忆总结要求”高度概括本轮新增剧情。这里必须是一条连贯记忆，不得逐动作罗列；不要输出 <br> 或其他 HTML 标签。若正文或世界时空栏明确给出剧情日期，必须以该剧情日期开头；不得使用聊天发送时间或猜测日期。
 【记忆完】
 
 【可编辑的记忆总结要求】
@@ -701,6 +720,7 @@ function buildProfileCaptureRequest(messageIndex) {
 1. 严格遵守下方边界标签；不要解释任务，不要使用 Markdown 代码块。可编辑要求只控制内容取舍和概括方式，不得更改本协议。
 2. 每个区块只能包含一条连贯记忆，不得把一个连续事件拆成逐动作流水账。
 3. 不要复述旧记忆；不要输出 <br> 或任何 HTML 标签。
+4. 若“本轮对话”或其世界时空栏明确给出剧情日期，【记忆条目】必须以该日期开头；若待归档短期记忆含有日期，【长期记忆条目】必须写明覆盖的起止日期。不得把聊天发送时间当成剧情时间，也不得猜测未给出的日期。
 
 【记忆总结要求】
 ${memoryInstruction}
