@@ -140,9 +140,22 @@
     display: block;
 }
 
+#ksm-direct-settings[hidden],
+#ksm-profile-settings[hidden],
+.ksm-settings-actions button[hidden] {
+    display: none !important;
+}
+
 #ksm-settings h3 {
     margin: 4px 0 14px;
     font-size: 16px;
+}
+
+#ksm-settings code {
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: rgb(0 0 0 / 10%);
+    font-size: .95em;
 }
 
 .ksm-setting-row {
