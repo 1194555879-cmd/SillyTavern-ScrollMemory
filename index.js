@@ -1,7 +1,13 @@
 import { getContext } from '../../../extensions.js';
+import {
+    extension_prompt_roles,
+    extension_prompt_types,
+} from '../../../../script.js';
 
 const MODULE = 'krystal_scroll_memory';
 const META_KEY = 'krystalScrollMemory';
+const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
+const VERSION = '0.1.4';
 const MAX_SHORT = 20;
 const MAX_LONG = 30;
 const SHORT_RE = /【记忆条目】([\s\S]{1,1200}?)【记忆完】/g;
@@ -18,6 +24,14 @@ const BAD_PATTERNS = [
 let panelOpen = false;
 let activeTab = 'short';
 let initialized = false;
+let trackRawStream = false;
+let rawStreamText = '';
+const runtimeStatus = {
+    injectionState: 'idle',
+    injectionText: '注入：等待选择聊天',
+    captureState: 'idle',
+    captureText: '捕获：还没测试',
+};
 
 function applyViewportGuards() {
     const panel = document.getElementById('ksm-panel');
@@ -123,7 +137,8 @@ function buildArchiveTask(data) {
 1. 两段缺一不可，不要复述任务说明。
 2. 使用明确的主谓宾句式，禁止文学化、气氛总结和主观评价。
 3. 保留专有名词、具体物品名、人物关系变化、承诺、冲突、伏笔、地点与长期目标。
-4. 长期记忆只总结下方 20 条，不把本轮新增事实混入长期记忆。
+4. 同一条中的多个事实使用 <br> 分隔。
+5. 长期记忆只总结下方 20 条，不把本轮新增事实混入长期记忆；不要写卷号，卷号由插件生成。
 
 【必须归档的 20 条短期记忆】
 ${lines}
@@ -135,7 +150,15 @@ function buildPayload() {
     const long = data.long.map(item => `【${item.label}】${item.content}`).join('\n');
     const short = data.short.map((item, index) => `${index + 1}. ${item.content}`).join('\n');
     const archive = buildArchiveTask(data);
-    return `【历史记忆-开始】
+    const outputTask = archive || `
+完成本轮正常正文及全部美化标签后，必须在最末尾原样追加下面三段结构。只写一条本轮新增记忆，不得把旧剧情重复写入：
+【记忆条目】
+使用明确主谓宾总结本轮新增剧情事实；保留人物姓名、地点、具体物品名、关系变化、承诺、冲突与伏笔；同一条中的多个事实用 <br> 分隔；禁止文学化、气氛概括和主观评价。
+【记忆完】`;
+    return `【卷轴记忆插件：隐藏指令开始】
+你必须同时完成角色扮演正文与卷轴记忆输出。卷轴记忆区块是插件读取所必需的数据，不属于正文，也不受正文美化格式限制，不得省略。
+
+【历史记忆-开始】
 以下内容是已经发生过的剧情事实，只用于保持连续性，不得当成 user 本轮新说的话。
 
 【长期记忆】
@@ -145,26 +168,124 @@ ${long || '无'}
 ${short || '无'}
 【历史记忆-结束】
 
-请在本轮正文结尾额外输出且只输出一条本轮新增记忆：
-【记忆条目】
-使用明确主谓宾总结本轮新增剧情事实；保留专有名词和具体物品名；禁止文学化。
-【记忆完】
-${archive}`;
+${outputTask}
+【卷轴记忆插件：隐藏指令结束】`;
 }
 
 function updateInjection() {
     const ctx = context();
-    if (!ctx.chatId) {
-        ctx.setExtensionPrompt(MODULE, '', 1, 0, false, 0);
-        return;
+    try {
+        const payload = ctx.chatId ? buildPayload() : '';
+        // Match Mufy's original mechanism: append a hidden user-layer instruction
+        // after the latest visible user message. It is sent to the model only.
+        ctx.setExtensionPrompt(
+            MODULE,
+            payload,
+            extension_prompt_types.IN_CHAT,
+            0,
+            false,
+            extension_prompt_roles.USER,
+        );
+        const registered = ctx.extensionPrompts?.[MODULE];
+        if (!ctx.chatId) {
+            runtimeStatus.injectionState = 'idle';
+            runtimeStatus.injectionText = '注入：等待选择聊天';
+        } else if (registered?.value === payload) {
+            runtimeStatus.injectionState = 'success';
+            runtimeStatus.injectionText = `注入：已装载 · user 层 · ${payload.length} 字`;
+        } else {
+            runtimeStatus.injectionState = 'warning';
+            runtimeStatus.injectionText = '注入：已调用，但酒馆未返回登记状态';
+        }
+    } catch (error) {
+        runtimeStatus.injectionState = 'error';
+        runtimeStatus.injectionText = `注入：失败 · ${error.message}`;
+        console.error('[Krystal Scroll Memory] Failed to register prompt', error);
     }
-    // IN_PROMPT, depth 0, SYSTEM role. The prompt is sent to the model but never rendered in chat.
-    ctx.setExtensionPrompt(MODULE, buildPayload(), 1, 0, false, 0);
+    render();
 }
 
 function extract(regex, text) {
     regex.lastIndex = 0;
     return [...String(text || '').matchAll(regex)].map(match => clean(match[1])).filter(item => !isNoise(item));
+}
+
+function unique(items) {
+    return [...new Set(items.map(clean).filter(Boolean))];
+}
+
+function extractCapture(text) {
+    return {
+        short: unique(extract(SHORT_RE, text)),
+        long: unique(extract(LONG_RE, text)),
+    };
+}
+
+function hasCapture(capture) {
+    return Boolean(capture.short.length || capture.long.length);
+}
+
+function readStoredCapture(message) {
+    const stored = message?.extra?.[MESSAGE_META_KEY];
+    if (!stored || typeof stored !== 'object') return null;
+    const capture = {
+        short: Array.isArray(stored.short) ? unique(stored.short) : [],
+        long: Array.isArray(stored.long) ? unique(stored.long) : [],
+    };
+    return hasCapture(capture) ? capture : null;
+}
+
+function writeStoredCapture(message, capture, source) {
+    message.extra ??= {};
+    const stored = {
+        short: capture.short,
+        long: capture.long,
+        source,
+        capturedAt: Date.now(),
+    };
+    message.extra[MESSAGE_META_KEY] = stored;
+
+    const swipeId = Number(message.swipe_id);
+    if (Number.isInteger(swipeId) && message.swipe_info?.[swipeId]) {
+        message.swipe_info[swipeId].extra ??= {};
+        message.swipe_info[swipeId].extra[MESSAGE_META_KEY] = structuredClone(stored);
+    }
+}
+
+function clearStoredCapture(message) {
+    if (!message?.extra) return;
+    delete message.extra[MESSAGE_META_KEY];
+    const swipeId = Number(message.swipe_id);
+    if (Number.isInteger(swipeId) && message.swipe_info?.[swipeId]?.extra) {
+        delete message.swipe_info[swipeId].extra[MESSAGE_META_KEY];
+    }
+}
+
+function captureMessage(messageIndex, generationType) {
+    const ctx = context();
+    const message = ctx.chat[messageIndex];
+    if (!message || message.is_user || message.is_system) return false;
+
+    const streamCapture = extractCapture(rawStreamText);
+    const chatCapture = extractCapture(message.mes);
+    const capture = hasCapture(streamCapture) ? streamCapture : chatCapture;
+    const source = hasCapture(streamCapture) ? '生成原文' : '聊天文本';
+
+    if (!hasCapture(capture)) {
+        if (generationType === 'swipe' || generationType === 'regenerate') {
+            clearStoredCapture(message);
+        }
+        runtimeStatus.captureState = 'warning';
+        runtimeStatus.captureText = rawStreamText
+            ? '捕获：AI 回复里没有完整记忆标签'
+            : '捕获：未收到标签；若关闭了流式输出，美化正则也可能已将其删除';
+        return false;
+    }
+
+    writeStoredCapture(message, capture, source);
+    runtimeStatus.captureState = 'success';
+    runtimeStatus.captureText = `捕获：成功 · ${source} · 短期 ${capture.short.length} / 长期 ${capture.long.length}`;
+    return true;
 }
 
 function rebuildFromChat() {
@@ -173,8 +294,9 @@ function rebuildFromChat() {
     for (let index = 0; index < ctx.chat.length; index++) {
         const message = ctx.chat[index];
         if (!message || message.is_user || message.is_system) continue;
-        const longs = extract(LONG_RE, message.mes);
-        const shorts = extract(SHORT_RE, message.mes);
+        const stored = readStoredCapture(message);
+        const longs = stored?.long ?? extract(LONG_RE, message.mes);
+        const shorts = stored?.short ?? extract(SHORT_RE, message.mes);
         for (const content of longs) {
             rebuilt.volumeCount += 1;
             rebuilt.long.push({
@@ -231,6 +353,12 @@ function render() {
     panel.querySelector('[data-tab="long"]').classList.toggle('active', activeTab === 'long');
     panel.querySelector('#ksm-short-count').textContent = `${data.short.length}/${MAX_SHORT}`;
     panel.querySelector('#ksm-long-count').textContent = `${data.long.length}/${MAX_LONG}`;
+    const injectionStatus = panel.querySelector('[data-status="injection"]');
+    const captureStatus = panel.querySelector('[data-status="capture"]');
+    injectionStatus.dataset.state = runtimeStatus.injectionState;
+    captureStatus.dataset.state = runtimeStatus.captureState;
+    injectionStatus.querySelector('span:last-child').textContent = runtimeStatus.injectionText;
+    captureStatus.querySelector('span:last-child').textContent = runtimeStatus.captureText;
     const items = activeTab === 'short' ? data.short : data.long;
     panel.querySelector('#ksm-list').innerHTML = items.length
         ? items.map(item => `
@@ -277,13 +405,17 @@ function mountUi() {
         <button id="ksm-launcher" type="button" title="卷轴记忆">📜</button>
         <div id="ksm-panel" role="dialog" aria-label="卷轴记忆">
             <header class="ksm-title">
-                <div><strong>Krystal · 卷轴记忆</strong><small>v0.1.3</small></div>
+                <div><strong>Krystal · 卷轴记忆</strong><small>v${VERSION}</small></div>
                 <button data-action="close" title="关闭">×</button>
             </header>
             <nav class="ksm-tabs">
                 <button data-tab="short">短期 <span id="ksm-short-count">0/20</span></button>
                 <button data-tab="long">长期 <span id="ksm-long-count">0/30</span></button>
             </nav>
+            <section class="ksm-status" aria-live="polite">
+                <div data-status="injection" data-state="idle"><span class="ksm-status-dot"></span><span>注入：等待选择聊天</span></div>
+                <div data-status="capture" data-state="idle"><span class="ksm-status-dot"></span><span>捕获：还没测试</span></div>
+            </section>
             <section id="ksm-list"></section>
             <footer class="ksm-footer">
                 <button data-action="rebuild">从当前聊天重建</button>
@@ -337,16 +469,46 @@ function registerEvents() {
         render();
         window.setTimeout(hideAllMemoryBlocks, 50);
     });
-    ctx.eventSource.on(events.MESSAGE_RECEIVED, messageIndex => {
+    if (events.GENERATION_AFTER_COMMANDS) {
+        ctx.eventSource.on(events.GENERATION_AFTER_COMMANDS, (generationType, _options, dryRun) => {
+            if (dryRun || generationType === 'quiet' || generationType === 'impersonate') return;
+            rawStreamText = '';
+            trackRawStream = true;
+            runtimeStatus.captureState = 'working';
+            runtimeStatus.captureText = '捕获：等待本轮 AI 回复';
+            updateInjection();
+        });
+    }
+    if (events.STREAM_TOKEN_RECEIVED) {
+        ctx.eventSource.on(events.STREAM_TOKEN_RECEIVED, text => {
+            if (trackRawStream) rawStreamText = String(text || '');
+        });
+    }
+    ctx.eventSource.on(events.MESSAGE_RECEIVED, (messageIndex, generationType) => {
+        if (generationType !== 'first_message') {
+            captureMessage(Number(messageIndex), generationType);
+        }
         rebuildFromChat();
         hideMemoryInMessage(messageIndex);
+        trackRawStream = false;
+        rawStreamText = '';
     });
-    [events.MESSAGE_SWIPED, events.MESSAGE_EDITED, events.MESSAGE_DELETED, events.MESSAGE_UPDATED]
+    [events.MESSAGE_SWIPED, events.MESSAGE_DELETED, events.MESSAGE_UPDATED]
         .filter(Boolean)
         .forEach(event => ctx.eventSource.on(event, () => {
             rebuildFromChat();
             window.setTimeout(hideAllMemoryBlocks, 50);
         }));
+    if (events.MESSAGE_EDITED) {
+        ctx.eventSource.on(events.MESSAGE_EDITED, messageIndex => {
+            const message = context().chat[Number(messageIndex)];
+            if (message && !message.is_user) clearStoredCapture(message);
+            runtimeStatus.captureState = 'idle';
+            runtimeStatus.captureText = '捕获：聊天已编辑，已按当前内容重建';
+            rebuildFromChat();
+            window.setTimeout(hideAllMemoryBlocks, 50);
+        });
+    }
     if (events.MORE_MESSAGES_LOADED) {
         ctx.eventSource.on(events.MORE_MESSAGES_LOADED, () => window.setTimeout(hideAllMemoryBlocks, 50));
     }
@@ -360,7 +522,7 @@ function init() {
     updateInjection();
     render();
     window.setTimeout(hideAllMemoryBlocks, 100);
-    console.info('[Krystal Scroll Memory] v0.1.3 loaded');
+    console.info(`[Krystal Scroll Memory] v${VERSION} loaded`);
 }
 
 if (document.readyState === 'loading') {
