@@ -10,7 +10,8 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.2.2';
+const VERSION = '0.2.3';
+const STATE_VERSION = 2;
 const SETTINGS_VERSION = 3;
 const CUSTOM_SECRET_KEY = 'api_key_custom';
 const DIRECT_SECRET_LABEL = 'Krystal · 卷轴记忆专用 API';
@@ -233,10 +234,13 @@ function makeLauncherDraggable(launcher) {
 
 function emptyState() {
     return {
-        version: 1,
+        version: STATE_VERSION,
         short: [],
         long: [],
         volumeCount: 0,
+        baseline: null,
+        baselineStatus: 'none',
+        staleArchiveCount: 0,
         updatedAt: Date.now(),
     };
 }
@@ -321,9 +325,15 @@ function state() {
         ctx.chatMetadata[META_KEY] = emptyState();
     }
     const data = ctx.chatMetadata[META_KEY];
+    data.version = STATE_VERSION;
     data.short = Array.isArray(data.short) ? data.short : [];
     data.long = Array.isArray(data.long) ? data.long : [];
     data.volumeCount = Number(data.volumeCount) || 0;
+    data.baseline = normalizeBaseline(data.baseline);
+    data.baselineStatus = ['none', 'fresh', 'stale'].includes(data.baselineStatus)
+        ? data.baselineStatus
+        : 'none';
+    data.staleArchiveCount = Number(data.staleArchiveCount) || 0;
     let normalized = false;
     for (const item of [...data.short, ...data.long]) {
         if (!item || typeof item !== 'object') continue;
@@ -358,6 +368,130 @@ function clean(text) {
         .replace(/[ \t]+\n/g, '\n')
         .trim()
         .replace(/\n{3,}/g, '\n\n');
+}
+
+function messageSnapshotText(message) {
+    return [
+        message?.is_user ? 'u' : 'a',
+        String(message?.send_date ?? ''),
+        Number(message?.swipe_id || 0),
+        String(message?.mes || ''),
+    ].join('␟');
+}
+
+function messageSnapshotDigest(message) {
+    return hash(messageSnapshotText(message));
+}
+
+function chatPrefixDigest(messages) {
+    return hash(messages.map(messageSnapshotText).join('␞'));
+}
+
+function createSourceSnapshot(chat, requestedCount = chat.length) {
+    const messageCount = clamp(Number(requestedCount) || 0, 0, chat.length);
+    const messages = chat.slice(0, messageCount);
+    const lastMessage = messages.at(-1);
+    return {
+        kind: 'sillytavern-chat',
+        chatMessages: messages.length,
+        assistantTurns: messages.filter(message => message && !message.is_user).length,
+        userTurns: messages.filter(message => message?.is_user).length,
+        throughMessageIndex: messages.length - 1,
+        throughSendDate: String(lastMessage?.send_date || ''),
+        prefixDigest: chatPrefixDigest(messages),
+        lastMessageDigest: lastMessage ? messageSnapshotDigest(lastMessage) : '',
+    };
+}
+
+function normalizeSource(source) {
+    if (!source || typeof source !== 'object') return null;
+    const chatMessages = Math.max(0, Number(source.chatMessages) || 0);
+    if (!chatMessages) return null;
+    return {
+        ...source,
+        chatMessages,
+        throughMessageIndex: Number.isInteger(Number(source.throughMessageIndex))
+            ? Number(source.throughMessageIndex)
+            : chatMessages - 1,
+        prefixDigest: String(source.prefixDigest || ''),
+        lastMessageDigest: String(source.lastMessageDigest || ''),
+    };
+}
+
+function normalizeMemoryItems(items, kind, origin = 'baseline') {
+    if (!Array.isArray(items)) return [];
+    return items
+        .map((item, index) => {
+            const source = item && typeof item === 'object' ? item : { content: item };
+            const content = clean(source.content);
+            if (!content) return null;
+            const volume = kind === 'long'
+                ? Math.max(1, Number(source.volume) || index + 1)
+                : undefined;
+            return {
+                ...source,
+                id: String(source.id || `${origin}-${kind}-${index + 1}-${hash(content)}`),
+                ...(kind === 'long' ? {
+                    volume,
+                    label: clean(source.label) || `第${chineseNumber(volume)}卷`,
+                } : {}),
+                content,
+                origin,
+            };
+        })
+        .filter(Boolean);
+}
+
+function normalizeBaseline(baseline) {
+    if (!baseline || typeof baseline !== 'object') return null;
+    const short = normalizeMemoryItems(baseline.short, 'short');
+    const long = normalizeMemoryItems(baseline.long, 'long');
+    if (!short.length && !long.length) return null;
+    return {
+        version: 1,
+        short,
+        long,
+        volumeCount: Math.max(
+            Number(baseline.volumeCount) || 0,
+            ...long.map(item => Number(item.volume) || 0),
+        ),
+        source: normalizeSource(baseline.source),
+        importedAt: Number(baseline.importedAt) || Date.now(),
+    };
+}
+
+function resolveBaselineBoundary(baseline, chat, endExclusive) {
+    const source = normalizeSource(baseline?.source);
+    if (!source) return { startIndex: endExclusive, status: 'fresh' };
+
+    const expectedCount = source.chatMessages;
+    if (expectedCount <= endExclusive
+        && source.prefixDigest
+        && chatPrefixDigest(chat.slice(0, expectedCount)) === source.prefixDigest) {
+        return { startIndex: expectedCount, status: 'fresh' };
+    }
+
+    if (source.lastMessageDigest) {
+        for (let index = Math.min(endExclusive, chat.length) - 1; index >= 0; index--) {
+            if (messageSnapshotDigest(chat[index]) === source.lastMessageDigest) {
+                return { startIndex: index + 1, status: 'stale' };
+            }
+        }
+    }
+
+    return {
+        startIndex: Math.min(expectedCount, endExclusive),
+        status: 'stale',
+    };
+}
+
+function archiveSourceDigest(items) {
+    return hash(
+        items
+            .slice(0, MAX_SHORT)
+            .map(item => clean(item?.content ?? item))
+            .join('␞'),
+    );
 }
 
 function isNoise(text) {
@@ -449,6 +583,7 @@ function updateInjection() {
     const ctx = context();
     try {
         const payload = ctx.chatId ? buildPayload() : '';
+        const data = ctx.chatId ? state() : null;
         // Match Mufy's original mechanism: append a hidden user-layer instruction
         // after the latest visible user message. It is sent to the model only.
         ctx.setExtensionPrompt(
@@ -463,6 +598,9 @@ function updateInjection() {
         if (!ctx.chatId) {
             runtimeStatus.injectionState = 'idle';
             runtimeStatus.injectionText = '注入：等待选择聊天';
+        } else if (data?.baselineStatus === 'stale') {
+            runtimeStatus.injectionState = 'warning';
+            runtimeStatus.injectionText = '注入：旧档仍在使用，但原楼层已变化；请重新导出、总结并导入';
         } else if (registered?.value === payload) {
             runtimeStatus.injectionState = 'success';
             runtimeStatus.injectionText = isDedicatedMode()
@@ -536,7 +674,9 @@ function buildProfileCaptureRequest(messageIndex) {
     );
     const currentTurn = formatMessages(ctx.chat.slice(turnStart, messageIndex + 1));
 
-    const memoryContext = (archiveRequired ? data.short : data.short.slice(-6))
+    const memoryContext = (archiveRequired
+        ? data.short.slice(0, MAX_SHORT)
+        : data.short.slice(-6))
         .map((item, index) => `${index + 1}. ${item.content}`)
         .join('\n');
 
@@ -585,6 +725,7 @@ ${referenceMessages || '无'}
 
     return {
         archiveRequired,
+        archiveSourceDigest: archiveRequired ? archiveSourceDigest(data.short) : '',
         messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
@@ -883,7 +1024,7 @@ async function sendDedicatedRequest(messages, maxTokens = pluginSettings().maxTo
 async function captureMessageWithProfile(messageIndex, snapshot) {
     const current = context();
     const message = current.chat[messageIndex];
-    if (!message || message.is_user || message.is_system) return false;
+    if (!message || message.is_user) return false;
     if (current.chatId !== snapshot.chatId
         || String(message.mes || '') !== snapshot.messageText
         || Number(message.swipe_id || 0) !== snapshot.swipeId) {
@@ -915,7 +1056,9 @@ async function captureMessageWithProfile(messageIndex, snapshot) {
             throw new Error('短期记忆已满，但记忆 API 没有返回长期归档标签');
         }
 
-        writeStoredCapture(latestMessage, capture, `独立 API · ${label}`);
+        writeStoredCapture(latestMessage, capture, `独立 API · ${label}`, {
+            archiveSourceDigest: request.archiveSourceDigest,
+        });
         rebuildFromChat();
         await latest.saveChat();
         runtimeStatus.captureState = 'success';
@@ -935,7 +1078,7 @@ async function captureMessageWithProfile(messageIndex, snapshot) {
 function queueProfileCapture(messageIndex) {
     const ctx = context();
     const message = ctx.chat[messageIndex];
-    if (!message || message.is_user || message.is_system) return Promise.resolve(false);
+    if (!message || message.is_user) return Promise.resolve(false);
     const snapshot = {
         chatId: ctx.chatId,
         messageText: String(message.mes || ''),
@@ -974,17 +1117,21 @@ function readStoredCapture(message) {
     const capture = {
         short: Array.isArray(stored.short) ? unique(stored.short) : [],
         long: Array.isArray(stored.long) ? unique(stored.long) : [],
+        archiveSourceDigest: String(stored.archiveSourceDigest || ''),
     };
     return hasCapture(capture) ? capture : null;
 }
 
-function writeStoredCapture(message, capture, source) {
+function writeStoredCapture(message, capture, source, metadata = {}) {
     message.extra ??= {};
     const stored = {
         short: capture.short,
         long: capture.long,
         source,
         capturedAt: Date.now(),
+        ...(metadata.archiveSourceDigest
+            ? { archiveSourceDigest: String(metadata.archiveSourceDigest) }
+            : {}),
     };
     message.extra[MESSAGE_META_KEY] = stored;
 
@@ -1007,7 +1154,7 @@ function clearStoredCapture(message) {
 function captureMessage(messageIndex, generationType) {
     const ctx = context();
     const message = ctx.chat[messageIndex];
-    if (!message || message.is_user || message.is_system) return false;
+    if (!message || message.is_user) return false;
 
     const streamCapture = extractCapture(rawStreamText);
     const chatCapture = extractCapture(message.mes);
@@ -1025,14 +1172,19 @@ function captureMessage(messageIndex, generationType) {
         return false;
     }
 
-    const archiveRequired = buildStateFromChat(messageIndex).short.length >= MAX_SHORT;
+    const sourceState = buildStateFromChat(messageIndex);
+    const archiveRequired = sourceState.short.length >= MAX_SHORT;
     if (archiveRequired && !capture.long.length) {
         runtimeStatus.captureState = 'warning';
         runtimeStatus.captureText = '捕获：短期记忆已满，但本轮缺少长期归档标签';
         return false;
     }
 
-    writeStoredCapture(message, capture, source);
+    writeStoredCapture(message, capture, source, {
+        archiveSourceDigest: archiveRequired && capture.long.length
+            ? archiveSourceDigest(sourceState.short)
+            : '',
+    });
     runtimeStatus.captureState = 'success';
     runtimeStatus.captureText = `捕获：成功 · ${source} · 短期 ${capture.short.length} / 长期 ${capture.long.length}`;
     return true;
@@ -1042,13 +1194,34 @@ function buildStateFromChat(endExclusive = context().chat.length) {
     const ctx = context();
     const rebuilt = emptyState();
     const end = clamp(Number(endExclusive) || 0, 0, ctx.chat.length);
-    for (let index = 0; index < end; index++) {
+    const baseline = normalizeBaseline(ctx.chatMetadata?.[META_KEY]?.baseline);
+    let startIndex = 0;
+    if (baseline) {
+        const boundary = resolveBaselineBoundary(baseline, ctx.chat, end);
+        rebuilt.baseline = baseline;
+        rebuilt.baselineStatus = boundary.status;
+        rebuilt.short = baseline.short.map(item => ({ ...item, origin: 'baseline' }));
+        rebuilt.long = baseline.long.map(item => ({ ...item, origin: 'baseline' }));
+        rebuilt.volumeCount = baseline.volumeCount;
+        startIndex = boundary.startIndex;
+    }
+
+    for (let index = startIndex; index < end; index++) {
         const message = ctx.chat[index];
-        if (!message || message.is_user || message.is_system) continue;
+        if (!message || message.is_user) continue;
         const stored = readStoredCapture(message);
         const longs = stored?.long ?? extract(LONG_RE, message.mes);
         const shorts = stored?.short ?? extract(SHORT_RE, message.mes);
-        for (const content of longs) {
+        for (let captureIndex = 0; captureIndex < longs.length; captureIndex++) {
+            const content = longs[captureIndex];
+            const archiveBatch = rebuilt.short.slice(0, MAX_SHORT);
+            const archiveReady = archiveBatch.length >= MAX_SHORT;
+            const sourceMatches = !stored?.archiveSourceDigest
+                || stored.archiveSourceDigest === archiveSourceDigest(archiveBatch);
+            if (!archiveReady || !sourceMatches) {
+                rebuilt.staleArchiveCount += 1;
+                continue;
+            }
             rebuilt.volumeCount += 1;
             rebuilt.long.push({
                 id: `v-${rebuilt.volumeCount}-${hash(content)}`,
@@ -1056,13 +1229,24 @@ function buildStateFromChat(endExclusive = context().chat.length) {
                 label: `第${chineseNumber(rebuilt.volumeCount)}卷`,
                 content,
                 messageIndex: index,
+                captureKind: 'long',
+                captureIndex,
+                origin: 'capture',
             });
-            if (rebuilt.short.length >= MAX_SHORT) rebuilt.short.splice(0, MAX_SHORT);
+            rebuilt.short.splice(0, MAX_SHORT);
         }
-        for (const content of shorts) {
+        for (let captureIndex = 0; captureIndex < shorts.length; captureIndex++) {
+            const content = shorts[captureIndex];
             const id = `m-${index}-${hash(content)}`;
-            if (rebuilt.short.some(item => item.id === id)) continue;
-            rebuilt.short.push({ id, content, messageIndex: index });
+            if (rebuilt.short.some(item => item.id === id || item.content === content)) continue;
+            rebuilt.short.push({
+                id,
+                content,
+                messageIndex: index,
+                captureKind: 'short',
+                captureIndex,
+                origin: 'capture',
+            });
         }
     }
     rebuilt.long = rebuilt.long.slice(-MAX_LONG);
@@ -1073,6 +1257,13 @@ function rebuildFromChat() {
     const ctx = context();
     const rebuilt = buildStateFromChat(ctx.chat.length);
     ctx.chatMetadata[META_KEY] = rebuilt;
+    if (rebuilt.baselineStatus === 'stale') {
+        runtimeStatus.captureState = 'warning';
+        runtimeStatus.captureText = '捕获：旧档来源已被重说、编辑或删除；请重新导出并导入旧档';
+    } else if (rebuilt.staleArchiveCount > 0) {
+        runtimeStatus.captureState = 'warning';
+        runtimeStatus.captureText = `捕获：${rebuilt.staleArchiveCount} 卷已因分支变化回退为短期记忆，将在后续回复重建`;
+    }
     save();
 }
 
@@ -1189,8 +1380,78 @@ function render() {
     renderSettings(panel);
 }
 
+function syncCaptureToCurrentSwipe(message) {
+    const swipeId = Number(message?.swipe_id);
+    if (!Number.isInteger(swipeId) || !message?.swipe_info?.[swipeId]) return;
+    message.swipe_info[swipeId].extra ??= {};
+    const stored = message.extra?.[MESSAGE_META_KEY];
+    if (stored) {
+        message.swipe_info[swipeId].extra[MESSAGE_META_KEY] = structuredClone(stored);
+    } else {
+        delete message.swipe_info[swipeId].extra[MESSAGE_META_KEY];
+    }
+}
+
+function persistMemoryItemChange(item, kind, action, nextContent = '') {
+    const ctx = context();
+    const data = state();
+    if (item.origin === 'baseline' && data.baseline) {
+        const list = kind === 'long' ? data.baseline.long : data.baseline.short;
+        const index = list.findIndex(candidate => candidate.id === item.id);
+        if (index < 0) return false;
+        if (action === 'save') list[index].content = clean(nextContent);
+        if (action === 'delete') list.splice(index, 1);
+        rebuildFromChat();
+        void ctx.saveChat();
+        return true;
+    }
+
+    if (item.origin === 'capture' && Number.isInteger(item.messageIndex)) {
+        const message = ctx.chat[item.messageIndex];
+        const stored = message?.extra?.[MESSAGE_META_KEY];
+        const list = stored?.[kind];
+        if (!Array.isArray(list)) return false;
+        let index = Number(item.captureIndex);
+        if (!Number.isInteger(index) || clean(list[index]) !== item.content) {
+            index = list.findIndex(content => clean(content) === item.content);
+        }
+        if (index < 0) return false;
+        if (action === 'save') list[index] = clean(nextContent);
+        if (action === 'delete') list.splice(index, 1);
+        if (!stored.short?.length && !stored.long?.length) {
+            delete message.extra[MESSAGE_META_KEY];
+        }
+        syncCaptureToCurrentSwipe(message);
+        rebuildFromChat();
+        void ctx.saveChat();
+        return true;
+    }
+
+    return false;
+}
+
 function downloadJson() {
-    const blob = new Blob([JSON.stringify(state(), null, 2)], { type: 'application/json' });
+    const data = state();
+    const exportItem = item => {
+        const exported = {
+            id: item.id,
+            content: item.content,
+        };
+        if (item.volume) exported.volume = item.volume;
+        if (item.label) exported.label = item.label;
+        if (item.sourceTurn) exported.sourceTurn = item.sourceTurn;
+        return exported;
+    };
+    const exported = {
+        version: STATE_VERSION,
+        format: 'krystal-scroll-memory',
+        short: data.short.map(exportItem),
+        long: data.long.map(exportItem),
+        volumeCount: data.volumeCount,
+        source: createSourceSnapshot(context().chat),
+        exportedAt: Date.now(),
+    };
+    const blob = new Blob([JSON.stringify(exported, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
@@ -1205,9 +1466,27 @@ function importJson(file) {
         try {
             const parsed = JSON.parse(String(reader.result));
             if (!Array.isArray(parsed.short) || !Array.isArray(parsed.long)) throw new Error('格式不正确');
-            context().chatMetadata[META_KEY] = parsed;
-            save();
-            toastr.success('卷轴记忆已导入');
+            const ctx = context();
+            const baseline = normalizeBaseline({
+                short: parsed.short,
+                long: parsed.long,
+                volumeCount: parsed.volumeCount,
+                source: normalizeSource(parsed.source) || createSourceSnapshot(ctx.chat),
+                importedAt: Date.now(),
+            });
+            if (!baseline) throw new Error('文件里没有可导入的记忆');
+            ctx.chatMetadata[META_KEY] = {
+                ...emptyState(),
+                baseline,
+            };
+            rebuildFromChat();
+            void ctx.saveChat();
+            const data = state();
+            if (data.baselineStatus === 'stale') {
+                toastr.warning('旧档已导入，但原聊天楼层与导出时不同；请重新导出旧档后再生成一次');
+            } else {
+                toastr.success(`旧档已固定导入，并合并当前聊天的新记忆（短期 ${data.short.length} / 长期 ${data.long.length}）`);
+            }
         } catch (error) {
             toastr.error(`导入失败：${error.message}`);
         }
@@ -1219,7 +1498,7 @@ function latestAssistantMessageIndex() {
     const chat = context().chat;
     for (let index = chat.length - 1; index >= 0; index--) {
         const message = chat[index];
-        if (message && !message.is_user && !message.is_system) return index;
+        if (message && !message.is_user) return index;
     }
     return -1;
 }
@@ -1368,9 +1647,17 @@ function mountUi() {
             const data = state();
             const list = activeTab === 'short' ? data.short : data.long;
             const index = list.findIndex(item => item.id === article.dataset.id);
-            if (index >= 0 && action === 'save-item') list[index].content = clean(article.querySelector('textarea').value);
-            if (index >= 0 && action === 'delete-item') list.splice(index, 1);
-            save();
+            if (index >= 0) {
+                const persisted = persistMemoryItemChange(
+                    list[index],
+                    activeTab,
+                    action === 'save-item' ? 'save' : 'delete',
+                    article.querySelector('textarea').value,
+                );
+                if (!persisted) {
+                    toastr.warning('这条记忆来自未迁移的旧标签，暂时无法持久修改');
+                }
+            }
         }
         render();
     });
