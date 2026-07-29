@@ -129,15 +129,35 @@
     overflow: auto;
 }
 
+#ksm-injection-preview {
+    display: none;
+    min-height: 180px;
+    padding: 4px 14px 18px;
+    overflow: auto;
+}
+
 #ksm-panel.ksm-settings-open .ksm-tabs,
 #ksm-panel.ksm-settings-open .ksm-status,
 #ksm-panel.ksm-settings-open #ksm-list,
-#ksm-panel.ksm-settings-open .ksm-footer {
+#ksm-panel.ksm-settings-open .ksm-footer,
+#ksm-panel.ksm-preview-open .ksm-tabs,
+#ksm-panel.ksm-preview-open .ksm-status,
+#ksm-panel.ksm-preview-open #ksm-list,
+#ksm-panel.ksm-preview-open .ksm-footer {
     display: none;
 }
 
 #ksm-panel.ksm-settings-open #ksm-settings {
     display: block;
+}
+
+#ksm-panel.ksm-preview-open #ksm-injection-preview {
+    display: block;
+}
+
+#ksm-panel.ksm-settings-open #ksm-injection-preview,
+#ksm-panel.ksm-preview-open #ksm-settings {
+    display: none;
 }
 
 #ksm-direct-settings[hidden],
@@ -146,9 +166,30 @@
     display: none !important;
 }
 
-#ksm-settings h3 {
+#ksm-settings h3,
+#ksm-injection-preview h3 {
     margin: 4px 0 14px;
     font-size: 16px;
+}
+
+.ksm-preview-meta {
+    margin: 0 0 9px;
+    opacity: .72;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+#ksm-injection-text {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 360px;
+    padding: 9px;
+    resize: vertical;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background: var(--SmartThemeBlurTintColor);
+    color: var(--SmartThemeBodyColor);
+    line-height: 1.45;
 }
 
 #ksm-settings code {
