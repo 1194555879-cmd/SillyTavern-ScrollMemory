@@ -10,9 +10,9 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.9';
+const VERSION = '0.3.10';
 const STATE_VERSION = 3;
-const SETTINGS_VERSION = 4;
+const SETTINGS_VERSION = 5;
 const SOURCE_DIGEST_VERSION = 2;
 const CUSTOM_SECRET_KEY = 'api_key_custom';
 const DIRECT_SECRET_LABEL = 'Krystal · 卷轴记忆专用 API';
@@ -74,6 +74,29 @@ const DEFAULT_MEMORY_INSTRUCTION = `【短期记忆要求】
 【通用禁则】
 禁止主观推测、评价、形容性扩写、文学化或诗化表达、情绪渲染和象征性总结。`;
 
+const SENSITIVE_ABSTRACTION_INSTRUCTION = `【敏感文本抽象协议】
+原文可能包含成人亲密或其他敏感场景。只归档推动剧情的中性事实：双方意愿与拒绝、关系变化、边界与规则、亲密行为是否发生或结束、是否达到高潮、避孕措施、受伤或健康风险、地点时间、事后照顾、承诺及情绪后果。
+禁止复述器官、体液、姿势、声音或逐动作刺激过程；不得补写原文没有的内容。若某项细节无法以中性方式表达，可省略该细节，但仍应总结同轮其余剧情事实。`;
+
+function abstractSensitiveSource(value) {
+    let text = String(value || '');
+    const sensitivePattern = /(性行为|做爱|性交|插入|抽插|射精|内射|高潮|阴茎|龟头|阴道|阴蒂|乳头|精液|爱液|口交|肛交|自慰|勃起|湿透|体液)/i;
+    if (!sensitivePattern.test(text)) return text;
+    const replacements = [
+        [/(内射|射入(?:体内|里面)?)/gi, '在体内达到高潮'],
+        [/(射精|射了|高潮)/gi, '达到高潮'],
+        [/(插入|抽插|性交|做爱|性行为)/gi, '发生亲密行为'],
+        [/(口交|肛交|自慰)/gi, '特定亲密行为'],
+        [/(阴茎|龟头|阴道|阴蒂|乳头)/gi, '私密部位'],
+        [/(精液|爱液|体液)/gi, '身体分泌物'],
+        [/(勃起|湿透)/gi, '出现明确生理反应'],
+    ];
+    for (const [pattern, replacement] of replacements) {
+        text = text.replace(pattern, replacement);
+    }
+    return text;
+}
+
 let panelOpen = false;
 let activeTab = 'short';
 let settingsOpen = false;
@@ -109,6 +132,7 @@ const DEFAULT_SETTINGS = {
     directModel: '',
     directSecretId: '',
     memoryInstruction: DEFAULT_MEMORY_INSTRUCTION,
+    sensitiveAbstraction: true,
     maxTokens: DEFAULT_MAX_TOKENS,
 };
 
@@ -323,6 +347,7 @@ function pluginSettings() {
     settings.memoryInstruction = String(
         settings.memoryInstruction || DEFAULT_MEMORY_INSTRUCTION,
     ).slice(0, MAX_MEMORY_INSTRUCTION_LENGTH);
+    settings.sensitiveAbstraction = settings.sensitiveAbstraction !== false;
     settings.maxTokens = clamp(
         Number(settings.maxTokens) || DEFAULT_MAX_TOKENS,
         MIN_MAX_TOKENS,
@@ -899,6 +924,7 @@ function messageSpeaker(message) {
 
 function buildProfileCaptureRequest(messageIndex) {
     const ctx = context();
+    const settings = pluginSettings();
     const data = buildStateFromChat(messageIndex);
     const archiveRequired = data.short.length >= MAX_SHORT;
     let turnStart = 0;
@@ -913,7 +939,10 @@ function buildProfileCaptureRequest(messageIndex) {
         .filter(message => message && !message.is_system)
         .map(message => {
             const role = message.is_user ? 'user' : 'assistant';
-            const content = stripMemoryBlocks(message.mes).slice(-16000);
+            const source = stripMemoryBlocks(message.mes).slice(-16000);
+            const content = settings.sensitiveAbstraction
+                ? abstractSensitiveSource(source)
+                : source;
             return `【${role}｜${messageSpeaker(message)}】\n${content}`;
         })
         .join('\n\n');
@@ -949,7 +978,10 @@ function buildProfileCaptureRequest(messageIndex) {
 【细节记忆】
 逐行输出本轮需要新增、更新或删除的稳定细节；没有变化只写“无”
 【细节记忆完】`;
-    const memoryInstruction = pluginSettings().memoryInstruction;
+    const memoryInstruction = settings.memoryInstruction;
+    const sensitiveAbstractionInstruction = settings.sensitiveAbstraction
+        ? `\n\n${SENSITIVE_ABSTRACTION_INSTRUCTION}`
+        : '';
 
     const systemPrompt = `你是独立的剧情记忆整理器，不参与角色扮演，也绝不续写剧情。
 把对话高度压缩成客观、清晰、可供下一轮调用的事实记忆。
@@ -960,7 +992,7 @@ function buildProfileCaptureRequest(messageIndex) {
 3. 不要复述旧记忆；不要输出 <br> 或任何 HTML 标签。
 4. 若“本轮对话”或其世界时空栏明确给出剧情日期，【记忆条目】必须以该日期开头；若待归档短期记忆含有日期，【长期记忆条目】必须写明覆盖的起止日期。不得把聊天发送时间当成剧情时间，也不得猜测未给出的日期。
 5. 【细节记忆】只记录跨轮仍有用的稳定事实：人物身份与关系、秘密及谁知道什么、关键物品与地点、承诺与日期、身体伤病与习惯、未解决线索。普通动作、气氛和已存在且未变化的事实不要重复。
-6. 【细节记忆】每行必须严格使用“新增/更新｜类别｜稳定键｜客观事实”或“删除｜类别｜稳定键｜-”。类别只能是：${FACT_CATEGORIES.join('、')}。同一事实必须沿用现有稳定键；事实改变时更新原键，禁止换键后重复。若没有变化，只写“无”。
+6. 【细节记忆】每行必须严格使用“新增/更新｜类别｜稳定键｜客观事实”或“删除｜类别｜稳定键｜-”。类别只能是：${FACT_CATEGORIES.join('、')}。同一事实必须沿用现有稳定键；事实改变时更新原键，禁止换键后重复。若没有变化，只写“无”。${sensitiveAbstractionInstruction}
 
 【记忆总结要求】
 ${memoryInstruction}
@@ -1108,6 +1140,7 @@ function directFormValues() {
         apiKey: panel?.querySelector('#ksm-direct-api-key')?.value || '',
         model: panel?.querySelector('#ksm-direct-model')?.value || '',
         memoryInstruction: panel?.querySelector('#ksm-memory-instruction')?.value || '',
+        sensitiveAbstraction: panel?.querySelector('#ksm-sensitive-abstraction')?.value !== 'off',
         maxTokens: panel?.querySelector('#ksm-max-tokens')?.value || DEFAULT_MAX_TOKENS,
     };
 }
@@ -1132,6 +1165,7 @@ async function saveDirectConfiguration({ notify = true } = {}) {
     settings.directModel = model;
     settings.directSecretId = secretId;
     settings.memoryInstruction = normalizeMemoryInstruction(form.memoryInstruction);
+    settings.sensitiveAbstraction = Boolean(form.sensitiveAbstraction);
     settings.maxTokens = clamp(
         Number(form.maxTokens) || DEFAULT_MAX_TOKENS,
         MIN_MAX_TOKENS,
@@ -1159,6 +1193,7 @@ async function saveMemoryConfiguration({ notify = true } = {}) {
     const settings = pluginSettings();
     const form = directFormValues();
     settings.memoryInstruction = normalizeMemoryInstruction(form.memoryInstruction);
+    settings.sensitiveAbstraction = Boolean(form.sensitiveAbstraction);
     settings.maxTokens = clamp(
         Number(form.maxTokens) || DEFAULT_MAX_TOKENS,
         MIN_MAX_TOKENS,
@@ -1244,7 +1279,9 @@ function emptyResponseReason(data) {
 }
 
 function saferRetryMessages(messages) {
-    const reminder = `【空响应重试要求】
+    const reminder = `${SENSITIVE_ABSTRACTION_INSTRUCTION}
+
+【空响应重试要求】
 若原文包含成人亲密或其他敏感情节，只记录关系变化、双方意愿、边界、承诺、结果及后续仍有用的事实；必须使用中性、非露骨措辞，不复述身体或性行为细节。即使内容敏感，也必须按原协议输出完整边界标签，不得返回空白。`;
     return messages.map((message, index) => (
         index === 0 && message.role === 'system'
@@ -1386,7 +1423,8 @@ async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
         rebuildFromChat();
         await latest.saveChat();
         const currentState = state();
-        const action = options.reason === 'retry'
+        const manualRetry = options.reason === 'retry' || options.reason === 'repair';
+        const action = manualRetry
             ? (replacedExistingCapture
                 ? '重试已替换本轮原总结（不会重复新增）'
                 : '重试已补写本轮总结')
@@ -2058,6 +2096,7 @@ function renderSettings(panel) {
     const keyStatus = panel.querySelector('#ksm-direct-key-status');
     const profile = panel.querySelector('#ksm-profile');
     const memoryInstruction = panel.querySelector('#ksm-memory-instruction');
+    const sensitiveAbstraction = panel.querySelector('#ksm-sensitive-abstraction');
     const maxTokens = panel.querySelector('#ksm-max-tokens');
     const saveButton = panel.querySelector('[data-action="save-settings"]');
     const testButton = panel.querySelector('[data-action="test-profile"]');
@@ -2094,6 +2133,7 @@ function renderSettings(panel) {
     if (memoryInstruction.dataset.dirty !== 'true') {
         memoryInstruction.value = settings.memoryInstruction;
     }
+    sensitiveAbstraction.value = settings.sensitiveAbstraction ? 'on' : 'off';
     if (maxTokens.dataset.dirty !== 'true') maxTokens.value = String(settings.maxTokens);
     maxTokens.disabled = settings.captureMode === 'inline';
     saveButton.hidden = false;
@@ -2524,6 +2564,33 @@ function latestAssistantMessageIndex() {
     return -1;
 }
 
+function recentCaptureRepairIndices(latestIndex, limit = 8) {
+    const ctx = context();
+    const recentAssistantIndices = [];
+    for (let index = latestIndex; index >= 0 && recentAssistantIndices.length < limit; index--) {
+        const message = ctx.chat[index];
+        if (message && !message.is_user && !message.is_system) {
+            recentAssistantIndices.unshift(index);
+        }
+    }
+    let lastMissingPosition = -1;
+    for (let position = 0; position < recentAssistantIndices.length; position++) {
+        const message = ctx.chat[recentAssistantIndices[position]];
+        if (!readStoredCapture(message)) lastMissingPosition = position;
+    }
+    if (lastMissingPosition < 0) return [latestIndex];
+
+    let start = lastMissingPosition;
+    while (start > 0 && !readStoredCapture(ctx.chat[recentAssistantIndices[start - 1]])) {
+        start--;
+    }
+    const hasCapturedAnchor = recentAssistantIndices
+        .slice(0, start)
+        .some(index => readStoredCapture(ctx.chat[index]));
+    if (!hasCapturedAnchor) return [latestIndex];
+    return recentAssistantIndices.slice(start);
+}
+
 async function retryLastCapture() {
     const messageIndex = latestAssistantMessageIndex();
     if (messageIndex < 0) {
@@ -2533,13 +2600,32 @@ async function retryLastCapture() {
     const detached = detachImportedTerminalMemory();
     if (detached.detached) rebuildFromChat();
     if (isDedicatedMode()) {
-        const captured = await queueProfileCapture(messageIndex, {
-            force: true,
-            reason: 'retry',
-            generationType: 'retry',
-        });
-        if (captured) {
-            toastr.success('已重新整理并替换最后一轮原总结；不会新增重复条目');
+        const repairIndices = recentCaptureRepairIndices(messageIndex);
+        const repairingGap = repairIndices.length > 1 || repairIndices[0] !== messageIndex;
+        if (repairingGap) {
+            runtimeStatus.captureState = 'working';
+            runtimeStatus.captureText = `捕获：发现最近缺失 ${repairIndices.length} 轮，正在按剧情顺序补写`;
+            render();
+            showActionFeedback(`发现缺失，正在按顺序补写 ${repairIndices.length} 轮…`, 'working', 0);
+        }
+        let completed = 0;
+        for (const index of repairIndices) {
+            const captured = await queueProfileCapture(index, {
+                force: true,
+                reason: repairingGap ? 'repair' : 'retry',
+                generationType: 'retry',
+            });
+            if (!captured) break;
+            completed++;
+        }
+        if (completed === repairIndices.length) {
+            const message = repairingGap
+                ? `已按顺序修复 ${completed} 轮缺失记忆，归档边界已重算`
+                : '已重新整理并替换最后一轮原总结；不会新增重复条目';
+            toastr.success(message);
+            showActionFeedback(message, 'success', 2600);
+        } else if (repairingGap) {
+            showActionFeedback(`补写在第 ${completed + 1} 轮停止，请查看捕获错误`, 'error', 3200);
         }
         return;
     }
@@ -2659,6 +2745,16 @@ function mountUi() {
                 </p>
                 <p class="ksm-setting-help ksm-setting-help-wide">
                     细节事实层会另外维护人物关系、秘密与知情边界、物品地点、承诺日期、身体习惯及未解线索；同一稳定键发生变化时覆盖旧值，不重复堆叠。
+                </p>
+                <label class="ksm-setting-row">
+                    <span>敏感内容抽象</span>
+                    <select id="ksm-sensitive-abstraction">
+                        <option value="on">开启（推荐）</option>
+                        <option value="off">关闭</option>
+                    </select>
+                </label>
+                <p class="ksm-setting-help">
+                    发送给记忆 API 前，先在本地把露骨过程改写成中性事实，同时保留同意、边界、关系变化与关键结果。不会导入 Claude 的正文写作词。
                 </p>
                 <label class="ksm-setting-row">
                     <span>最大输出</span>
@@ -2881,6 +2977,18 @@ function mountUi() {
                 ? '捕获：独立 API 已配置，请先测试连接'
                 : '捕获：请先选择记忆 API 连接配置';
             savePluginSettings();
+        }
+        if (event.target.id === 'ksm-sensitive-abstraction') {
+            settings.sensitiveAbstraction = event.target.value !== 'off';
+            context().saveSettingsDebounced();
+            runtimeStatus.captureState = 'idle';
+            runtimeStatus.captureText = settings.sensitiveAbstraction
+                ? '捕获：敏感内容抽象已开启'
+                : '捕获：敏感内容抽象已关闭';
+            showActionFeedback(settings.sensitiveAbstraction
+                ? '敏感内容抽象已开启'
+                : '敏感内容抽象已关闭');
+            render();
         }
         if (event.target.id === 'ksm-max-tokens') {
             settings.maxTokens = clamp(
