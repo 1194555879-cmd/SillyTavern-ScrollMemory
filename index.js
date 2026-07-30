@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.10';
+const VERSION = '0.3.11';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 5;
 const SOURCE_DIGEST_VERSION = 2;
@@ -218,12 +218,16 @@ function applyViewportGuards() {
     panel.style.setProperty('z-index', '2147483000', 'important');
     launcher.style.setProperty('z-index', '2147482999', 'important');
 
-    const touchLayout = window.matchMedia('(hover: none) and (pointer: coarse)').matches
-        || window.innerWidth <= 1100;
+    const touchLayout = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
     if (touchLayout) {
         panel.style.setProperty(
             'top',
             'max(76px, calc(env(safe-area-inset-top) + 48px))',
+            'important',
+        );
+        panel.style.setProperty(
+            'height',
+            'calc(100dvh - 164px - env(safe-area-inset-bottom))',
             'important',
         );
         panel.style.setProperty(
@@ -233,6 +237,7 @@ function applyViewportGuards() {
         );
     } else {
         panel.style.removeProperty('top');
+        panel.style.removeProperty('height');
         panel.style.removeProperty('max-height');
     }
     window.requestAnimationFrame(restoreLauncherPosition);
