@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.8';
+const VERSION = '0.3.9';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 4;
 const SOURCE_DIGEST_VERSION = 2;
@@ -1203,6 +1203,8 @@ function restoreDefaultMemoryInstruction() {
 function directResponseText(data) {
     const content = data?.choices?.[0]?.message?.content
         ?? data?.choices?.[0]?.text
+        ?? data?.candidates?.[0]?.content?.parts
+        ?? data?.output?.[0]?.content
         ?? data?.output_text
         ?? data?.content
         ?? '';
@@ -1214,70 +1216,126 @@ function directResponseText(data) {
     return String(content || '');
 }
 
+function emptyResponseReason(data) {
+    const finishReason = String(
+        data?.choices?.[0]?.finish_reason
+        ?? data?.choices?.[0]?.finishReason
+        ?? data?.candidates?.[0]?.finishReason
+        ?? '',
+    ).toLowerCase();
+    const blockReason = String(
+        data?.promptFeedback?.blockReason
+        ?? data?.prompt_feedback?.block_reason
+        ?? '',
+    ).toLowerCase();
+    if (finishReason.includes('content_filter')
+        || finishReason.includes('safety')
+        || blockReason.includes('safety')
+        || blockReason.includes('block')) {
+        return '疑似被上游安全过滤';
+    }
+    if (finishReason.includes('length') || finishReason.includes('max_token')) {
+        return '输出长度达到上限';
+    }
+    if (!data?.choices?.length && !data?.candidates?.length && !data?.output_text && !data?.content) {
+        return '上游没有返回候选结果';
+    }
+    return finishReason ? `上游结束原因：${finishReason}` : '上游未说明原因';
+}
+
+function saferRetryMessages(messages) {
+    const reminder = `【空响应重试要求】
+若原文包含成人亲密或其他敏感情节，只记录关系变化、双方意愿、边界、承诺、结果及后续仍有用的事实；必须使用中性、非露骨措辞，不复述身体或性行为细节。即使内容敏感，也必须按原协议输出完整边界标签，不得返回空白。`;
+    return messages.map((message, index) => (
+        index === 0 && message.role === 'system'
+            ? { ...message, content: `${message.content}\n\n${reminder}` }
+            : message
+    ));
+}
+
+function announceEmptyRetry(reason) {
+    runtimeStatus.captureState = 'working';
+    runtimeStatus.captureText = `捕获：API 返回空内容（${reason}），正在自动重试一次`;
+    render();
+}
+
 async function sendDirectRequest(messages, maxTokens = pluginSettings().maxTokens) {
     const settings = pluginSettings();
     const apiUrl = normalizeDirectApiUrl(settings.directApiUrl);
     if (!settings.directModel) throw new Error('请先填写模型名称并保存');
     if (!settings.directSecretId) throw new Error('请先填写 API 密钥并保存');
 
-    const response = await fetch('/api/backends/chat-completions/generate', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        cache: 'no-cache',
-        body: JSON.stringify({
-            stream: false,
-            messages,
-            model: settings.directModel,
-            chat_completion_source: 'custom',
-            custom_url: apiUrl,
-            secret_id: settings.directSecretId,
-            max_tokens: maxTokens,
-            temperature: 0.2,
-            use_sysprompt: true,
-        }),
-    });
-    const raw = await response.text();
-    let data;
-    try {
-        data = JSON.parse(raw);
-    } catch {
-        throw new Error(raw || `记忆 API 返回了无法解析的内容（${response.status}）`);
+    let finalEmptyReason = '上游未说明原因';
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetch('/api/backends/chat-completions/generate', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            cache: 'no-cache',
+            body: JSON.stringify({
+                stream: false,
+                messages: attempt === 0 ? messages : saferRetryMessages(messages),
+                model: settings.directModel,
+                chat_completion_source: 'custom',
+                custom_url: apiUrl,
+                secret_id: settings.directSecretId,
+                max_tokens: maxTokens,
+                temperature: attempt === 0 ? 0.2 : 0.1,
+                use_sysprompt: true,
+            }),
+        });
+        const raw = await response.text();
+        let data;
+        try {
+            data = JSON.parse(raw);
+        } catch {
+            throw new Error(raw || `记忆 API 返回了无法解析的内容（${response.status}）`);
+        }
+        if (!response.ok || data?.error) {
+            const message = data?.error?.message
+                ?? data?.message
+                ?? `请求失败（${response.status}）`;
+            throw new Error(String(message));
+        }
+        const text = directResponseText(data);
+        if (text.trim()) {
+            return {
+                label: settings.directModel,
+                text,
+            };
+        }
+        finalEmptyReason = emptyResponseReason(data);
+        if (attempt === 0) announceEmptyRetry(finalEmptyReason);
     }
-    if (!response.ok || data?.error) {
-        const message = data?.error?.message
-            ?? data?.message
-            ?? `请求失败（${response.status}）`;
-        throw new Error(String(message));
-    }
-    const text = directResponseText(data);
-    if (!text.trim()) throw new Error('记忆 API 返回了空内容');
-    return {
-        label: settings.directModel,
-        text,
-    };
+    throw new Error(`记忆 API 连续两次返回空内容（${finalEmptyReason}）`);
 }
 
 async function sendProfileRequest(messages, maxTokens = pluginSettings().maxTokens) {
     const profile = selectedProfile();
     if (!profile) throw new Error('请先选择一个可用的记忆 API 连接配置');
     const service = connectionService();
-    const prompt = service.constructPrompt(messages, profile.id);
-    const response = await service.sendRequest(
-        profile.id,
-        prompt,
-        maxTokens,
-        {
-            stream: false,
-            extractData: true,
-            includePreset: true,
-            includeInstruct: true,
-        },
-    );
-    const text = typeof response === 'string'
-        ? response
-        : response?.content ?? response?.text ?? '';
-    if (!String(text).trim()) throw new Error('记忆 API 返回了空内容');
-    return { label: profile.name, text: String(text) };
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const prompt = service.constructPrompt(
+            attempt === 0 ? messages : saferRetryMessages(messages),
+            profile.id,
+        );
+        const response = await service.sendRequest(
+            profile.id,
+            prompt,
+            maxTokens,
+            {
+                stream: false,
+                extractData: true,
+                includePreset: true,
+                includeInstruct: true,
+            },
+        );
+        const text = typeof response === 'string'
+            ? response
+            : response?.content ?? response?.text ?? directResponseText(response);
+        if (String(text).trim()) return { label: profile.name, text: String(text) };
+        if (attempt === 0) announceEmptyRetry(emptyResponseReason(response));
+    }
+    throw new Error('记忆 API 连续两次返回空内容（上游未说明原因）');
 }
 
 async function sendDedicatedRequest(messages, maxTokens = pluginSettings().maxTokens) {
