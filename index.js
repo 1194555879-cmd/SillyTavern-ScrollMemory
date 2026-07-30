@@ -1732,7 +1732,7 @@ async function sendDirectRequest(messages, maxTokens = pluginSettings().maxToken
                 'error',
                 { 耗时毫秒: Math.round(performance.now() - startedAt) },
             );
-            throw new Error(raw || `记忆 API 返回了无法解析的内容（${response.status}）`);
+            throw new Error(`记忆 API 返回了无法解析的内容（${response.status}）`);
         }
         if (!response.ok || data?.error) {
             const message = data?.error?.message
@@ -4076,18 +4076,24 @@ function registerEvents() {
             }
         });
     }
-    [events.MESSAGE_DELETED, events.MESSAGE_UPDATED]
-        .filter(Boolean)
-        .forEach(event => ctx.eventSource.on(event, () => {
+    if (events.MESSAGE_DELETED) {
+        ctx.eventSource.on(events.MESSAGE_DELETED, () => {
             addDiagnosticLog(
-                'chat.structure.changed',
-                '聊天楼层发生变化',
-                '正在按当前楼层重新计算记忆',
+                'chat.message.deleted',
+                '聊天楼层已删除',
+                '正在按剩余楼层重新计算记忆',
                 'warning',
             );
             rebuildFromChat();
             window.setTimeout(hideAllMemoryBlocks, 50);
-        }));
+        });
+    }
+    if (events.MESSAGE_UPDATED) {
+        ctx.eventSource.on(events.MESSAGE_UPDATED, () => {
+            rebuildFromChat();
+            window.setTimeout(hideAllMemoryBlocks, 50);
+        });
+    }
     if (events.MESSAGE_EDITED) {
         ctx.eventSource.on(events.MESSAGE_EDITED, messageIndex => {
             addDiagnosticLog(
