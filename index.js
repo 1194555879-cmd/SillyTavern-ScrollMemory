@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.9';
+const VERSION = '0.3.10';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 4;
 const SOURCE_DIGEST_VERSION = 2;
@@ -1386,7 +1386,8 @@ async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
         rebuildFromChat();
         await latest.saveChat();
         const currentState = state();
-        const action = options.reason === 'retry'
+        const manualRetry = options.reason === 'retry' || options.reason === 'repair';
+        const action = manualRetry
             ? (replacedExistingCapture
                 ? '重试已替换本轮原总结（不会重复新增）'
                 : '重试已补写本轮总结')
@@ -2524,6 +2525,33 @@ function latestAssistantMessageIndex() {
     return -1;
 }
 
+function recentCaptureRepairIndices(latestIndex, limit = 8) {
+    const ctx = context();
+    const recentAssistantIndices = [];
+    for (let index = latestIndex; index >= 0 && recentAssistantIndices.length < limit; index--) {
+        const message = ctx.chat[index];
+        if (message && !message.is_user && !message.is_system) {
+            recentAssistantIndices.unshift(index);
+        }
+    }
+    let lastMissingPosition = -1;
+    for (let position = 0; position < recentAssistantIndices.length; position++) {
+        const message = ctx.chat[recentAssistantIndices[position]];
+        if (!readStoredCapture(message)) lastMissingPosition = position;
+    }
+    if (lastMissingPosition < 0) return [latestIndex];
+
+    let start = lastMissingPosition;
+    while (start > 0 && !readStoredCapture(ctx.chat[recentAssistantIndices[start - 1]])) {
+        start--;
+    }
+    const hasCapturedAnchor = recentAssistantIndices
+        .slice(0, start)
+        .some(index => readStoredCapture(ctx.chat[index]));
+    if (!hasCapturedAnchor) return [latestIndex];
+    return recentAssistantIndices.slice(start);
+}
+
 async function retryLastCapture() {
     const messageIndex = latestAssistantMessageIndex();
     if (messageIndex < 0) {
@@ -2533,13 +2561,32 @@ async function retryLastCapture() {
     const detached = detachImportedTerminalMemory();
     if (detached.detached) rebuildFromChat();
     if (isDedicatedMode()) {
-        const captured = await queueProfileCapture(messageIndex, {
-            force: true,
-            reason: 'retry',
-            generationType: 'retry',
-        });
-        if (captured) {
-            toastr.success('已重新整理并替换最后一轮原总结；不会新增重复条目');
+        const repairIndices = recentCaptureRepairIndices(messageIndex);
+        const repairingGap = repairIndices.length > 1 || repairIndices[0] !== messageIndex;
+        if (repairingGap) {
+            runtimeStatus.captureState = 'working';
+            runtimeStatus.captureText = `捕获：发现最近缺失 ${repairIndices.length} 轮，正在按剧情顺序补写`;
+            render();
+            showActionFeedback(`发现缺失，正在按顺序补写 ${repairIndices.length} 轮…`, 'working', 0);
+        }
+        let completed = 0;
+        for (const index of repairIndices) {
+            const captured = await queueProfileCapture(index, {
+                force: true,
+                reason: repairingGap ? 'repair' : 'retry',
+                generationType: 'retry',
+            });
+            if (!captured) break;
+            completed++;
+        }
+        if (completed === repairIndices.length) {
+            const message = repairingGap
+                ? `已按顺序修复 ${completed} 轮缺失记忆，归档边界已重算`
+                : '已重新整理并替换最后一轮原总结；不会新增重复条目';
+            toastr.success(message);
+            showActionFeedback(message, 'success', 2600);
+        } else if (repairingGap) {
+            showActionFeedback(`补写在第 ${completed + 1} 轮停止，请查看捕获错误`, 'error', 3200);
         }
         return;
     }
