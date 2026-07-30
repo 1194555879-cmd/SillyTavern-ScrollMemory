@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.7';
+const VERSION = '0.3.8';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 4;
 const SOURCE_DIGEST_VERSION = 2;
@@ -2164,6 +2164,13 @@ function replayClass(element, className, duration = 360) {
     window.setTimeout(() => element.classList.remove(className), duration);
 }
 
+function revealOverlay(element) {
+    if (!element) return;
+    element.classList.remove('is-visible');
+    void element.offsetWidth;
+    window.requestAnimationFrame(() => element.classList.add('is-visible'));
+}
+
 function showActionFeedback(message, state = 'success', duration = 1800) {
     const feedback = document.getElementById('ksm-action-feedback');
     if (!feedback) return;
@@ -2178,7 +2185,7 @@ function showActionFeedback(message, state = 'success', duration = 1800) {
     }
     const copy = feedback.querySelector('.ksm-action-feedback-copy');
     if (copy) copy.textContent = message;
-    replayClass(feedback, 'is-visible', 420);
+    revealOverlay(feedback);
     if (duration > 0) {
         actionFeedbackTimer = window.setTimeout(() => {
             feedback.classList.remove('is-visible');
@@ -2202,7 +2209,7 @@ function requestDeleteConfirmation(item, kind, label) {
     if (!prompt) return;
     prompt.querySelector('.ksm-delete-confirm-copy').textContent = `确定删除“${label}”吗？`;
     prompt.hidden = false;
-    replayClass(prompt, 'is-visible', 420);
+    revealOverlay(prompt);
 }
 
 function confirmPendingDelete() {
