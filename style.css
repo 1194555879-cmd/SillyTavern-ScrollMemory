@@ -425,7 +425,9 @@
 
 #ksm-direct-settings[hidden],
 #ksm-profile-settings[hidden],
-.ksm-settings-actions button[hidden] {
+.ksm-settings-actions button[hidden],
+.ksm-update-actions button[hidden],
+.ksm-decision-dialog[hidden] {
     display: none !important;
 }
 
@@ -578,6 +580,66 @@
 
 .ksm-setting-help-wide {
     margin-left: 0;
+}
+
+.ksm-update-card,
+.ksm-diagnostic-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 10px 0 15px;
+    padding: 11px 12px;
+    border: 1px solid var(--ksm-line);
+    border-radius: 13px;
+    background:
+        linear-gradient(145deg, color-mix(in srgb, var(--ksm-accent) 9%, transparent), transparent),
+        var(--ksm-surface);
+}
+
+.ksm-update-copy,
+.ksm-diagnostic-card > span {
+    display: grid;
+    min-width: 0;
+    gap: 3px;
+}
+
+.ksm-update-copy strong,
+.ksm-diagnostic-card strong {
+    color: var(--ksm-text);
+    font-size: 12px;
+}
+
+.ksm-update-copy small,
+.ksm-diagnostic-card small {
+    color: var(--ksm-muted);
+    font-size: 10px;
+    line-height: 1.4;
+}
+
+.ksm-update-actions {
+    display: flex;
+    flex: 0 0 auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
+#ksm-panel .ksm-update-actions button,
+#ksm-panel .ksm-diagnostic-card button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    min-height: 32px;
+    padding: 5px 8px;
+    font-size: 10px;
+}
+
+#ksm-panel .ksm-update-actions .ksm-update-primary {
+    border-color: color-mix(in srgb, var(--ksm-accent) 44%, transparent);
+    background: var(--ksm-surface-active);
+    color: var(--ksm-emphasis);
 }
 
 .ksm-settings-actions {
@@ -1244,6 +1306,106 @@
     border-color: color-mix(in srgb, #df6b6b 60%, transparent);
     background: color-mix(in srgb, #df6b6b 18%, var(--ksm-surface-raised));
     color: #df6b6b;
+}
+
+.ksm-decision-dialog {
+    position: absolute;
+    z-index: 20;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    padding: 18px;
+    background: color-mix(in srgb, var(--ksm-theme-bg) 58%, transparent);
+    opacity: 0;
+    pointer-events: auto;
+    backdrop-filter: blur(7px);
+    -webkit-backdrop-filter: blur(7px);
+}
+
+.ksm-decision-dialog.is-visible {
+    opacity: 1;
+    transition: opacity .2s ease;
+}
+
+.ksm-decision-card {
+    box-sizing: border-box;
+    width: min(370px, 100%);
+    padding: 18px;
+    border: 1px solid color-mix(in srgb, var(--ksm-accent) 42%, var(--ksm-line));
+    border-radius: 17px;
+    background:
+        radial-gradient(circle at 15% 0%, color-mix(in srgb, var(--ksm-accent) 14%, transparent), transparent 38%),
+        color-mix(in srgb, var(--ksm-theme-bg) 96%, var(--ksm-text) 3%);
+    box-shadow: 0 18px 52px rgb(0 0 0 / 38%);
+    text-align: center;
+    transform: translateY(8px) scale(.98);
+    animation: ksm-decision-in .25s cubic-bezier(.2,.8,.25,1) both;
+}
+
+.ksm-decision-icon {
+    display: grid;
+    place-items: center;
+    width: 42px;
+    height: 42px;
+    margin: 0 auto 10px;
+    border: 1px solid color-mix(in srgb, var(--ksm-accent) 38%, transparent);
+    border-radius: 14px;
+    background: var(--ksm-surface-active);
+    color: var(--ksm-emphasis);
+    font-size: 16px;
+}
+
+.ksm-decision-warning {
+    border-color: color-mix(in srgb, #e0a749 48%, transparent);
+    background: color-mix(in srgb, #e0a749 15%, var(--ksm-surface-raised));
+    color: #d5962f;
+}
+
+.ksm-decision-card h4 {
+    margin: 0 0 8px;
+    color: var(--ksm-text);
+    font-size: 15px;
+}
+
+.ksm-decision-card p {
+    margin: 6px 0;
+    color: var(--ksm-muted);
+    font-size: 11px;
+    line-height: 1.55;
+}
+
+.ksm-decision-card .ksm-decision-emphasis {
+    color: #d5962f;
+    font-weight: 700;
+}
+
+.ksm-decision-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 7px;
+    margin-top: 15px;
+}
+
+#ksm-panel .ksm-decision-actions button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    min-height: 34px;
+    padding: 6px 9px;
+    font-size: 10px;
+}
+
+#ksm-panel .ksm-decision-actions .ksm-decision-primary {
+    border-color: color-mix(in srgb, var(--ksm-accent) 48%, transparent);
+    background: var(--ksm-surface-active);
+    color: var(--ksm-emphasis);
+}
+
+@keyframes ksm-decision-in {
+    from { opacity: 0; transform: translateY(12px) scale(.97); }
+    to { opacity: 1; transform: none; }
 }
 
 @keyframes ksm-button-press {

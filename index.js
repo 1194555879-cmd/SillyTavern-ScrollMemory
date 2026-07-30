@@ -10,12 +10,13 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.11';
+const VERSION = '0.3.12';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 5;
 const SOURCE_DIGEST_VERSION = 2;
 const CUSTOM_SECRET_KEY = 'api_key_custom';
 const DIRECT_SECRET_LABEL = 'Krystal · 卷轴记忆专用 API';
+const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/1194555879-cmd/SillyTavern-ScrollMemory/main/manifest.json';
 const MAX_MEMORY_INSTRUCTION_LENGTH = 8000;
 const MAX_SHORT = 20;
 const MAX_LONG = 30;
@@ -80,21 +81,25 @@ const SENSITIVE_ABSTRACTION_INSTRUCTION = `【敏感文本抽象协议】
 
 function abstractSensitiveSource(value) {
     let text = String(value || '');
-    const sensitivePattern = /(性行为|做爱|性交|插入|抽插|射精|内射|高潮|阴茎|龟头|阴道|阴蒂|乳头|精液|爱液|口交|肛交|自慰|勃起|湿透|体液)/i;
+    const sensitivePattern = /(性行为|性爱|亲热|做爱|性交|插入|抽插|射精|内射|射入|射了|高潮|阴茎|龟头|阴道|阴蒂|乳头|精液|爱液|口交|肛交|自慰|勃起|湿透|体液|下体|性器官|肉棒|阳具|蜜穴|花穴|后穴|淫液|深喉|舔舐|吮吸|含弄|吞咽|抽送|挺入|顶入|泄出|orgasm|cum|ejaculat|blowjob|handjob|penetrat|cock|dick|pussy|anal sex|oral sex|fuck)/i;
     if (!sensitivePattern.test(text)) return text;
     const replacements = [
-        [/(内射|射入(?:体内|里面)?)/gi, '在体内达到高潮'],
-        [/(射精|射了|高潮)/gi, '达到高潮'],
-        [/(插入|抽插|性交|做爱|性行为)/gi, '发生亲密行为'],
-        [/(口交|肛交|自慰)/gi, '特定亲密行为'],
-        [/(阴茎|龟头|阴道|阴蒂|乳头)/gi, '私密部位'],
-        [/(精液|爱液|体液)/gi, '身体分泌物'],
+        [/(内射|射入(?:体内|里面)?|射在(?:体内|里面))/gi, '亲密行为结束且存在体内遗留风险'],
+        [/(射精|射了|高潮|泄出|orgasm|ejaculat(?:e|ed|ion)?|\bcum\b)/gi, '达到高潮'],
+        [/(插入|抽插|性交|做爱|性行为|性爱|penetrat(?:e|ed|ion)?|\bfuck(?:ing|ed)?\b)/gi, '发生亲密行为'],
+        [/(口交|肛交|自慰|深喉|blowjob|handjob|anal sex|oral sex)/gi, '特定亲密行为'],
+        [/(阴茎|龟头|阴道|阴蒂|乳头|下体|性器官|肉棒|阳具|蜜穴|花穴|后穴|cock|dick|pussy)/gi, '私密部位'],
+        [/(精液|爱液|淫液|体液)/gi, '身体分泌物'],
         [/(勃起|湿透)/gi, '出现明确生理反应'],
+        [/(舔舐|吮吸|含弄|吞咽|抽送|挺入|顶入)/gi, '进行亲密接触'],
     ];
     for (const [pattern, replacement] of replacements) {
         text = text.replace(pattern, replacement);
     }
-    return text;
+    return text
+        .replace(/发生发生亲密行为/g, '发生亲密行为')
+        .replace(/(?:发生亲密行为[、，；。\s]*){2,}/g, '发生亲密行为。')
+        .replace(/(?:进行亲密接触[、，；。\s]*){2,}/g, '进行亲密接触。');
 }
 
 let panelOpen = false;
@@ -109,6 +114,16 @@ let generationInProgress = false;
 let factBootstrapRunning = false;
 let actionFeedbackTimer = 0;
 let pendingDelete = null;
+let pendingEmptyRetry = null;
+let lastEmptyDiagnostic = null;
+let updateConfirmationOpen = false;
+const updateRuntime = {
+    checking: false,
+    updating: false,
+    latest: '',
+    available: false,
+    message: `当前 v${VERSION} · 尚未检查更新`,
+};
 const openFactCategories = new Set();
 const scheduledProfileCaptures = new Map();
 const pendingProfileCaptures = new Map();
@@ -956,13 +971,16 @@ function buildProfileCaptureRequest(messageIndex) {
     );
     const currentTurn = formatMessages(ctx.chat.slice(turnStart, messageIndex + 1));
 
+    const abstractContext = value => (
+        settings.sensitiveAbstraction ? abstractSensitiveSource(value) : String(value || '')
+    );
     const memoryContext = (archiveRequired
         ? data.short.slice(0, MAX_SHORT)
         : data.short.slice(-6))
-        .map((item, index) => `${index + 1}. ${item.content}`)
+        .map((item, index) => `${index + 1}. ${abstractContext(item.content)}`)
         .join('\n');
     const factContext = data.facts
-        .map(item => `${item.category}｜${item.key}｜${item.content}`)
+        .map(item => abstractContext(`${item.category}｜${item.key}｜${item.content}`))
         .join('\n');
 
     const outputFormat = archiveRequired
@@ -1022,13 +1040,16 @@ ${currentTurn || '无'}
 ${referenceMessages || '无'}
 
 请严格按指定边界标签输出。`;
+    const safeUserPrompt = settings.sensitiveAbstraction
+        ? abstractSensitiveSource(userPrompt)
+        : userPrompt;
 
     return {
         archiveRequired,
         archiveSourceDigest: archiveRequired ? archiveSourceDigest(data.short) : '',
         messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
+            { role: 'user', content: safeUserPrompt },
         ],
     };
 }
@@ -1283,22 +1304,147 @@ function emptyResponseReason(data) {
     return finishReason ? `上游结束原因：${finishReason}` : '上游未说明原因';
 }
 
+function buildEmptyDiagnostic(data, options = {}) {
+    const finishReason = String(
+        data?.choices?.[0]?.finish_reason
+        ?? data?.choices?.[0]?.finishReason
+        ?? data?.candidates?.[0]?.finishReason
+        ?? '未提供',
+    );
+    const blockReason = String(
+        data?.promptFeedback?.blockReason
+        ?? data?.prompt_feedback?.block_reason
+        ?? '未提供',
+    );
+    let endpoint = '酒馆连接配置';
+    if (options.apiUrl) {
+        try {
+            endpoint = new URL(options.apiUrl).host;
+        } catch {
+            endpoint = '自定义接口';
+        }
+    }
+    const headers = options.response?.headers;
+    const requestId = headers?.get?.('x-request-id')
+        || headers?.get?.('request-id')
+        || headers?.get?.('cf-ray')
+        || '未提供';
+    return {
+        time: new Date().toLocaleString(),
+        attempt: Number(options.attempt) || 1,
+        model: String(options.model || '未提供'),
+        endpoint,
+        httpStatus: options.response?.status ?? '未提供',
+        contentType: headers?.get?.('content-type') || '未提供',
+        requestId,
+        finishReason,
+        blockReason,
+        choices: Array.isArray(data?.choices) ? data.choices.length : 0,
+        candidates: Array.isArray(data?.candidates) ? data.candidates.length : 0,
+        responseKeys: data && typeof data === 'object'
+            ? Object.keys(data).slice(0, 16).join(', ') || '无'
+            : '非对象响应',
+        elapsedMs: Math.max(0, Math.round(Number(options.elapsedMs) || 0)),
+        reason: emptyResponseReason(data),
+    };
+}
+
+function formatEmptyDiagnostic(diagnostic = lastEmptyDiagnostic) {
+    if (!diagnostic) return '暂无空回诊断';
+    return [
+        'Krystal · 卷轴记忆空回诊断',
+        `时间：${diagnostic.time}`,
+        `模型：${diagnostic.model}`,
+        `接口主机：${diagnostic.endpoint}`,
+        `请求序号：第 ${diagnostic.attempt} 次（本次可能已计费）`,
+        `HTTP：${diagnostic.httpStatus}`,
+        `Content-Type：${diagnostic.contentType}`,
+        `Request ID：${diagnostic.requestId}`,
+        `finish reason：${diagnostic.finishReason}`,
+        `block reason：${diagnostic.blockReason}`,
+        `choices / candidates：${diagnostic.choices} / ${diagnostic.candidates}`,
+        `响应字段：${diagnostic.responseKeys}`,
+        `耗时：${diagnostic.elapsedMs}ms`,
+        `插件判断：${diagnostic.reason}`,
+        '诊断不包含 API 密钥、原始剧情或完整请求内容。',
+    ].join('\n');
+}
+
+async function copyLastEmptyDiagnostic() {
+    const text = formatEmptyDiagnostic();
+    try {
+        await navigator.clipboard.writeText(text);
+    } catch {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.append(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        textarea.remove();
+    }
+    showActionFeedback('空回诊断已复制');
+}
+
 function saferRetryMessages(messages) {
     const reminder = `${SENSITIVE_ABSTRACTION_INSTRUCTION}
 
 【空响应重试要求】
-若原文包含成人亲密或其他敏感情节，只记录关系变化、双方意愿、边界、承诺、结果及后续仍有用的事实；必须使用中性、非露骨措辞，不复述身体或性行为细节。即使内容敏感，也必须按原协议输出完整边界标签，不得返回空白。`;
-    return messages.map((message, index) => (
-        index === 0 && message.role === 'system'
-            ? { ...message, content: `${message.content}\n\n${reminder}` }
-            : message
-    ));
+只处理已经发生的剧情事实。省略所有身体、姿势、声音与逐动作过程，只保留人物、意愿、边界、关系变化、关键结果、健康风险、地点和事后安排。必须按原协议输出完整边界标签。`;
+    return messages.map((message, index) => ({
+        ...message,
+        content: index === 0 && message.role === 'system'
+            ? `${message.content}\n\n${reminder}`
+            : abstractSensitiveSource(message.content),
+    }));
 }
 
-function announceEmptyRetry(reason) {
-    runtimeStatus.captureState = 'working';
-    runtimeStatus.captureText = `捕获：API 返回空内容（${reason}），正在自动重试一次`;
+function requestEmptyRetryConfirmation(diagnostic) {
+    lastEmptyDiagnostic = diagnostic;
+    if (pendingEmptyRetry?.resolve) {
+        pendingEmptyRetry.resolve(false);
+    }
+    panelOpen = true;
+    settingsOpen = false;
+    injectionPreviewOpen = false;
+    runtimeStatus.captureState = 'warning';
+    runtimeStatus.captureText = `捕获：API 空回 · ${diagnostic.reason} · 等待你决定是否再次计费重试`;
+    return new Promise(resolve => {
+        pendingEmptyRetry = { resolve, diagnostic };
+        render();
+    });
+}
+
+function settleEmptyRetry(shouldRetry) {
+    const pending = pendingEmptyRetry;
+    if (!pending) return;
+    pendingEmptyRetry = null;
+    runtimeStatus.captureState = shouldRetry ? 'working' : 'error';
+    runtimeStatus.captureText = shouldRetry
+        ? '捕获：已确认再次请求，正在使用加强抽象重试'
+        : '捕获：已停止；没有发送第二次请求';
     render();
+    pending.resolve(Boolean(shouldRetry));
+}
+
+function renderPersistentDialogs(panel) {
+    const emptyDialog = panel.querySelector('#ksm-empty-retry-confirm');
+    const emptyVisible = Boolean(pendingEmptyRetry);
+    emptyDialog.hidden = !emptyVisible;
+    emptyDialog.classList.toggle('is-visible', emptyVisible);
+    if (emptyVisible) {
+        emptyDialog.querySelector('.ksm-decision-reason').textContent
+            = `${pendingEmptyRetry.diagnostic.reason}。第一笔请求可能已经计费。`;
+    }
+
+    const updateDialog = panel.querySelector('#ksm-update-confirm');
+    updateDialog.hidden = !updateConfirmationOpen;
+    updateDialog.classList.toggle('is-visible', updateConfirmationOpen);
+    if (updateConfirmationOpen) {
+        updateDialog.querySelector('.ksm-decision-reason').textContent
+            = `当前 v${VERSION}，将更新到 v${updateRuntime.latest || '最新版本'}。更新后页面会自动刷新。`;
+    }
 }
 
 async function sendDirectRequest(messages, maxTokens = pluginSettings().maxTokens) {
@@ -1307,21 +1453,21 @@ async function sendDirectRequest(messages, maxTokens = pluginSettings().maxToken
     if (!settings.directModel) throw new Error('请先填写模型名称并保存');
     if (!settings.directSecretId) throw new Error('请先填写 API 密钥并保存');
 
-    let finalEmptyReason = '上游未说明原因';
-    for (let attempt = 0; attempt < 2; attempt++) {
+    const runAttempt = async (requestMessages, attempt) => {
+        const startedAt = performance.now();
         const response = await fetch('/api/backends/chat-completions/generate', {
             method: 'POST',
             headers: getRequestHeaders(),
             cache: 'no-cache',
             body: JSON.stringify({
                 stream: false,
-                messages: attempt === 0 ? messages : saferRetryMessages(messages),
+                messages: requestMessages,
                 model: settings.directModel,
                 chat_completion_source: 'custom',
                 custom_url: apiUrl,
                 secret_id: settings.directSecretId,
                 max_tokens: maxTokens,
-                temperature: attempt === 0 ? 0.2 : 0.1,
+                temperature: attempt === 1 ? 0.2 : 0.1,
                 use_sysprompt: true,
             }),
         });
@@ -1338,28 +1484,47 @@ async function sendDirectRequest(messages, maxTokens = pluginSettings().maxToken
                 ?? `请求失败（${response.status}）`;
             throw new Error(String(message));
         }
-        const text = directResponseText(data);
-        if (text.trim()) {
-            return {
-                label: settings.directModel,
-                text,
-            };
-        }
-        finalEmptyReason = emptyResponseReason(data);
-        if (attempt === 0) announceEmptyRetry(finalEmptyReason);
+        return {
+            data,
+            response,
+            text: directResponseText(data),
+            diagnostic: buildEmptyDiagnostic(data, {
+                attempt,
+                model: settings.directModel,
+                apiUrl,
+                response,
+                elapsedMs: performance.now() - startedAt,
+            }),
+        };
+    };
+
+    const first = await runAttempt(messages, 1);
+    if (first.text.trim()) {
+        return { label: settings.directModel, text: first.text };
     }
-    throw new Error(`记忆 API 连续两次返回空内容（${finalEmptyReason}）`);
+
+    const authorized = await requestEmptyRetryConfirmation(first.diagnostic);
+    if (!authorized) {
+        throw new Error(`API 返回空内容（${first.diagnostic.reason}）；已停止，未发送第二次请求`);
+    }
+
+    const second = await runAttempt(saferRetryMessages(messages), 2);
+    if (second.text.trim()) {
+        return { label: settings.directModel, text: second.text };
+    }
+    lastEmptyDiagnostic = second.diagnostic;
+    render();
+    throw new Error(`加强抽象重试后仍为空（${second.diagnostic.reason}）`);
 }
 
 async function sendProfileRequest(messages, maxTokens = pluginSettings().maxTokens) {
     const profile = selectedProfile();
     if (!profile) throw new Error('请先选择一个可用的记忆 API 连接配置');
     const service = connectionService();
-    for (let attempt = 0; attempt < 2; attempt++) {
-        const prompt = service.constructPrompt(
-            attempt === 0 ? messages : saferRetryMessages(messages),
-            profile.id,
-        );
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        const startedAt = performance.now();
+        const requestMessages = attempt === 1 ? messages : saferRetryMessages(messages);
+        const prompt = service.constructPrompt(requestMessages, profile.id);
         const response = await service.sendRequest(
             profile.id,
             prompt,
@@ -1375,9 +1540,28 @@ async function sendProfileRequest(messages, maxTokens = pluginSettings().maxToke
             ? response
             : response?.content ?? response?.text ?? directResponseText(response);
         if (String(text).trim()) return { label: profile.name, text: String(text) };
-        if (attempt === 0) announceEmptyRetry(emptyResponseReason(response));
+
+        const responseData = response && typeof response === 'object' ? response : {};
+        const diagnostic = buildEmptyDiagnostic(responseData, {
+            attempt,
+            model: profile.model || profile.name,
+            elapsedMs: performance.now() - startedAt,
+        });
+        lastEmptyDiagnostic = diagnostic;
+        if (attempt === 1) {
+            const authorized = await requestEmptyRetryConfirmation(diagnostic);
+            if (!authorized) {
+                throw new Error(`API 返回空内容（${diagnostic.reason}）；已停止，未发送第二次请求`);
+            }
+            runtimeStatus.captureState = 'working';
+            runtimeStatus.captureText = '捕获：已确认再次请求，正在使用加强抽象重试';
+            render();
+        } else {
+            render();
+            throw new Error(`加强抽象重试后仍为空（${diagnostic.reason}）`);
+        }
     }
-    throw new Error('记忆 API 连续两次返回空内容（上游未说明原因）');
+    throw new Error('记忆 API 返回空内容');
 }
 
 async function sendDedicatedRequest(messages, maxTokens = pluginSettings().maxTokens) {
@@ -2088,6 +2272,133 @@ function escapeHtml(value) {
     })[char]);
 }
 
+function isNewerVersion(candidate, current) {
+    const left = String(candidate || '').split('.').map(part => Number.parseInt(part, 10) || 0);
+    const right = String(current || '').split('.').map(part => Number.parseInt(part, 10) || 0);
+    const length = Math.max(left.length, right.length);
+    for (let index = 0; index < length; index++) {
+        if ((left[index] || 0) > (right[index] || 0)) return true;
+        if ((left[index] || 0) < (right[index] || 0)) return false;
+    }
+    return false;
+}
+
+async function checkForPluginUpdate({ notify = false } = {}) {
+    if (updateRuntime.checking || updateRuntime.updating) return;
+    updateRuntime.checking = true;
+    updateRuntime.message = '正在检查 GitHub 新版本…';
+    render();
+    try {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 8000);
+        let response;
+        try {
+            response = await fetch(`${REMOTE_MANIFEST_URL}?t=${Date.now()}`, {
+                method: 'GET',
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+        } finally {
+            window.clearTimeout(timer);
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const remote = await response.json();
+        const latest = String(remote?.version || '').trim();
+        if (!latest) throw new Error('远端清单没有版本号');
+        updateRuntime.latest = latest;
+        updateRuntime.available = isNewerVersion(latest, VERSION);
+        updateRuntime.message = updateRuntime.available
+            ? `发现 v${latest} · 可以在这里直接更新`
+            : `当前 v${VERSION} · 已是最新版本`;
+        if (notify) {
+            showActionFeedback(updateRuntime.available
+                ? `发现新版本 v${latest}`
+                : '当前已经是最新版本');
+        }
+    } catch (error) {
+        updateRuntime.message = `检查失败 · ${error.message}`;
+        if (notify) showActionFeedback(`检查更新失败：${error.message}`, 'error', 2600);
+    } finally {
+        updateRuntime.checking = false;
+        render();
+    }
+}
+
+function extensionFolderName() {
+    try {
+        const pathname = decodeURIComponent(new URL(import.meta.url).pathname);
+        const marker = '/third-party/';
+        const markerIndex = pathname.indexOf(marker);
+        if (markerIndex >= 0) {
+            const folder = pathname.slice(markerIndex + marker.length).split('/')[0];
+            if (folder) return folder;
+        }
+    } catch {
+        // Fall through to the repository folder name.
+    }
+    return 'SillyTavern-ScrollMemory';
+}
+
+async function discoverExtensionType(folder) {
+    try {
+        const response = await fetch('/api/extensions/discover', {
+            method: 'GET',
+            headers: getRequestHeaders(),
+            cache: 'no-store',
+        });
+        if (!response.ok) return null;
+        const list = await response.json();
+        const target = `third-party/${folder}`;
+        const found = Array.isArray(list) ? list.find(item => item?.name === target) : null;
+        return ['global', 'local', 'system'].includes(found?.type) ? found.type : null;
+    } catch {
+        return null;
+    }
+}
+
+async function performPluginUpdate() {
+    if (updateRuntime.updating) return;
+    updateConfirmationOpen = false;
+    updateRuntime.updating = true;
+    updateRuntime.message = '正在通过酒馆更新卷轴记忆…';
+    render();
+    try {
+        const folder = extensionFolderName();
+        const type = await discoverExtensionType(folder);
+        const response = await fetch('/api/extensions/update', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({
+                extensionName: folder,
+                global: type === 'global',
+            }),
+        });
+        if (!response.ok) {
+            const detail = await response.text().catch(() => '');
+            throw new Error(detail || response.statusText || `HTTP ${response.status}`);
+        }
+        const result = await response.json().catch(() => ({}));
+        if (result?.isUpToDate) {
+            updateRuntime.available = false;
+            updateRuntime.latest = VERSION;
+            updateRuntime.message = `当前 v${VERSION} · 已是最新版本`;
+            showActionFeedback('卷轴记忆已经是最新版本');
+            return;
+        }
+        updateRuntime.available = false;
+        updateRuntime.message = `更新成功 · ${result?.shortCommitHash || '正在刷新'}`;
+        showActionFeedback('更新成功，正在刷新页面…', 'success', 0);
+        window.setTimeout(() => window.location.reload(), 1000);
+    } catch (error) {
+        updateRuntime.message = `更新失败 · ${error.message}`;
+        showActionFeedback(`更新失败：${error.message}`, 'error', 3200);
+        toastr.error(`卷轴记忆更新失败：${error.message}`);
+    } finally {
+        updateRuntime.updating = false;
+        render();
+    }
+}
+
 function renderSettings(panel) {
     const settings = pluginSettings();
     const profiles = settings.captureMode === 'profile' ? supportedProfiles() : [];
@@ -2103,6 +2414,11 @@ function renderSettings(panel) {
     const memoryInstruction = panel.querySelector('#ksm-memory-instruction');
     const sensitiveAbstraction = panel.querySelector('#ksm-sensitive-abstraction');
     const maxTokens = panel.querySelector('#ksm-max-tokens');
+    const updateStatus = panel.querySelector('#ksm-update-status');
+    const checkUpdateButton = panel.querySelector('[data-action="check-update"]');
+    const performUpdateButton = panel.querySelector('[data-action="request-update"]');
+    const diagnosticStatus = panel.querySelector('#ksm-diagnostic-status');
+    const copyDiagnosticButton = panel.querySelector('[data-action="copy-empty-diagnostic"]');
     const saveButton = panel.querySelector('[data-action="save-settings"]');
     const testButton = panel.querySelector('[data-action="test-profile"]');
     const profileExists = profiles.some(item => item.id === settings.connectionProfileId);
@@ -2147,6 +2463,16 @@ function renderSettings(panel) {
     testButton.title = settings.captureMode === 'direct' && !directConfigured
         ? '会先保存当前填写内容，再测试连接'
         : '';
+    updateStatus.textContent = updateRuntime.message;
+    checkUpdateButton.disabled = updateRuntime.checking || updateRuntime.updating;
+    checkUpdateButton.querySelector('span').textContent = updateRuntime.checking ? '检查中…' : '检查更新';
+    performUpdateButton.hidden = !updateRuntime.available;
+    performUpdateButton.disabled = updateRuntime.updating;
+    performUpdateButton.querySelector('span').textContent = updateRuntime.updating ? '更新中…' : '立即更新';
+    diagnosticStatus.textContent = lastEmptyDiagnostic
+        ? `最近一次：${lastEmptyDiagnostic.reason} · 第 ${lastEmptyDiagnostic.attempt} 次请求`
+        : '暂无空回诊断';
+    copyDiagnosticButton.disabled = !lastEmptyDiagnostic;
 }
 
 function renderInjectionPreview(panel) {
@@ -2401,6 +2727,7 @@ function render() {
                 </div>`);
     renderSettings(panel);
     renderInjectionPreview(panel);
+    renderPersistentDialogs(panel);
 }
 
 function syncCaptureToCurrentSwipe(message) {
@@ -2692,6 +3019,16 @@ function mountUi() {
                     <span class="ksm-section-icon"><i class="fa-solid fa-sliders"></i></span>
                     <span><h3>卷轴记忆设置</h3><small>外观、连接、模型与总结指令</small></span>
                 </div>
+                <div class="ksm-update-card">
+                    <span class="ksm-update-copy">
+                        <strong>插件更新</strong>
+                        <small id="ksm-update-status">当前 v${VERSION} · 尚未检查更新</small>
+                    </span>
+                    <span class="ksm-update-actions">
+                        <button data-action="check-update"><i class="fa-solid fa-arrows-rotate"></i><span>检查更新</span></button>
+                        <button data-action="request-update" class="ksm-update-primary" hidden><i class="fa-solid fa-download"></i><span>立即更新</span></button>
+                    </span>
+                </div>
                 <label class="ksm-setting-row">
                     <span>面板外观</span>
                     <select id="ksm-appearance">
@@ -2759,8 +3096,15 @@ function mountUi() {
                     </select>
                 </label>
                 <p class="ksm-setting-help">
-                    发送给记忆 API 前，先在本地把露骨过程改写成中性事实，同时保留同意、边界、关系变化与关键结果。不会导入 Claude 的正文写作词。
+                    发送给记忆 API 前，会统一抽象本轮正文、最近记忆和细节事实，保留同意、边界、关系变化与关键结果。不会导入 Claude 的正文写作词。
                 </p>
+                <div class="ksm-diagnostic-card">
+                    <span>
+                        <strong>空回诊断</strong>
+                        <small id="ksm-diagnostic-status">暂无空回诊断</small>
+                    </span>
+                    <button data-action="copy-empty-diagnostic" disabled><i class="fa-solid fa-copy"></i><span>复制诊断</span></button>
+                </div>
                 <label class="ksm-setting-row">
                     <span>最大输出</span>
                     <input id="ksm-max-tokens" type="number" min="${MIN_MAX_TOKENS}" max="${MAX_MAX_TOKENS}" step="100" inputmode="numeric">
@@ -2796,6 +3140,30 @@ function mountUi() {
                     <button data-action="cancel-delete">取消</button>
                     <button data-action="confirm-delete" class="ksm-confirm-danger">确认删除</button>
                 </span>
+            </div>
+            <div id="ksm-empty-retry-confirm" class="ksm-decision-dialog" role="alertdialog" aria-modal="true" aria-label="空回重试确认" hidden>
+                <div class="ksm-decision-card">
+                    <span class="ksm-decision-icon ksm-decision-warning"><i class="fa-solid fa-coins"></i></span>
+                    <h4>记忆 API 返回了空内容</h4>
+                    <p class="ksm-decision-reason">第一笔请求可能已经计费。</p>
+                    <p class="ksm-decision-emphasis">再次请求可能再次扣费，插件不会替你自动重试。</p>
+                    <div class="ksm-decision-actions">
+                        <button data-action="copy-empty-diagnostic"><i class="fa-solid fa-copy"></i><span>复制诊断</span></button>
+                        <button data-action="cancel-empty-retry"><span>停止，不再请求</span></button>
+                        <button data-action="confirm-empty-retry" class="ksm-decision-primary"><i class="fa-solid fa-shield-halved"></i><span>加强抽象重试</span></button>
+                    </div>
+                </div>
+            </div>
+            <div id="ksm-update-confirm" class="ksm-decision-dialog" role="alertdialog" aria-modal="true" aria-label="插件更新确认" hidden>
+                <div class="ksm-decision-card">
+                    <span class="ksm-decision-icon"><i class="fa-solid fa-cloud-arrow-down"></i></span>
+                    <h4>更新卷轴记忆</h4>
+                    <p class="ksm-decision-reason">更新后页面会自动刷新。</p>
+                    <div class="ksm-decision-actions">
+                        <button data-action="cancel-update"><span>稍后</span></button>
+                        <button data-action="confirm-update" class="ksm-decision-primary"><i class="fa-solid fa-download"></i><span>更新并刷新</span></button>
+                    </div>
+                </div>
             </div>
             <footer class="ksm-footer">
                 <div class="ksm-footer-primary">
@@ -2844,6 +3212,39 @@ function mountUi() {
             return;
         }
         const action = button.dataset.action;
+        if (action === 'copy-empty-diagnostic') {
+            void copyLastEmptyDiagnostic();
+            return;
+        }
+        if (action === 'cancel-empty-retry') {
+            settleEmptyRetry(false);
+            return;
+        }
+        if (action === 'confirm-empty-retry') {
+            settleEmptyRetry(true);
+            return;
+        }
+        if (action === 'check-update') {
+            void checkForPluginUpdate({ notify: true });
+            return;
+        }
+        if (action === 'request-update') {
+            if (updateRuntime.available) {
+                updateConfirmationOpen = true;
+                render();
+            }
+            return;
+        }
+        if (action === 'cancel-update') {
+            updateConfirmationOpen = false;
+            render();
+            showActionFeedback('已暂缓更新');
+            return;
+        }
+        if (action === 'confirm-update') {
+            void performPluginUpdate();
+            return;
+        }
         if (action === 'close') panelOpen = false;
         if (action === 'settings') {
             settingsOpen = !settingsOpen;
@@ -3137,6 +3538,7 @@ function init() {
     render();
     window.setTimeout(refreshCurrentChatState, 600);
     window.setTimeout(hideAllMemoryBlocks, 100);
+    window.setTimeout(() => void checkForPluginUpdate(), 1200);
     console.info(`[Krystal Scroll Memory] v${VERSION} loaded`);
 }
 
