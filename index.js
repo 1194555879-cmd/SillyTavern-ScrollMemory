@@ -10,13 +10,15 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.12';
+const VERSION = '0.3.13';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 5;
 const SOURCE_DIGEST_VERSION = 2;
 const CUSTOM_SECRET_KEY = 'api_key_custom';
 const DIRECT_SECRET_LABEL = 'Krystal · 卷轴记忆专用 API';
 const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/1194555879-cmd/SillyTavern-ScrollMemory/main/manifest.json';
+const DIAGNOSTIC_LOG_KEY = 'krystalScrollMemoryDiagnosticLog:v1';
+const MAX_DIAGNOSTIC_LOGS = 60;
 const MAX_MEMORY_INSTRUCTION_LENGTH = 8000;
 const MAX_SHORT = 20;
 const MAX_LONG = 30;
@@ -102,10 +104,209 @@ function abstractSensitiveSource(value) {
         .replace(/(?:进行亲密接触[、，；。\s]*){2,}/g, '进行亲密接触。');
 }
 
+function safeDiagnosticText(value, maximum = 280) {
+    let text = String(value ?? '')
+        .replace(/\bsk-[A-Za-z0-9_-]{6,}\b/g, '[已隐藏密钥]')
+        .replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, '[已隐藏密钥]')
+        .replace(/(Bearer\s+)[^\s,;]+/gi, '$1[已隐藏]')
+        .replace(/((?:api[_ -]?key|authorization|token|secret)[\s"'=:]+)[^,\s"']+/gi, '$1[已隐藏]')
+        .replace(/[\r\n\t]+/g, ' ')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+    text = abstractSensitiveSource(text);
+    return text.length > maximum ? `${text.slice(0, maximum)}…` : text;
+}
+
+function readDiagnosticLog() {
+    if (Array.isArray(diagnosticLogCache)) return diagnosticLogCache;
+    try {
+        const parsed = JSON.parse(localStorage.getItem(DIAGNOSTIC_LOG_KEY) || '[]');
+        diagnosticLogCache = Array.isArray(parsed)
+            ? parsed.filter(item => item && typeof item === 'object').slice(-MAX_DIAGNOSTIC_LOGS)
+            : [];
+    } catch {
+        diagnosticLogCache = [];
+    }
+    return diagnosticLogCache;
+}
+
+function writeDiagnosticLog(entries) {
+    diagnosticLogCache = entries.slice(-MAX_DIAGNOSTIC_LOGS);
+    try {
+        localStorage.setItem(DIAGNOSTIC_LOG_KEY, JSON.stringify(diagnosticLogCache));
+    } catch {
+        // The current session still retains the log when a privacy-restricted
+        // webview blocks persistent storage.
+    }
+}
+
+function diagnosticMemorySnapshot() {
+    try {
+        const data = context().chatMetadata?.[META_KEY];
+        return {
+            short: Array.isArray(data?.short) ? data.short.length : 0,
+            long: Array.isArray(data?.long) ? data.long.length : 0,
+            facts: Array.isArray(data?.facts) ? data.facts.length : 0,
+        };
+    } catch {
+        return { short: 0, long: 0, facts: 0 };
+    }
+}
+
+function addDiagnosticLog(event, title, detail = '', level = 'info', metadata = {}) {
+    const safeMetadata = {};
+    for (const [key, value] of Object.entries(metadata || {})) {
+        if (value === undefined || value === null || value === '') continue;
+        safeMetadata[safeDiagnosticText(key, 40)] = safeDiagnosticText(
+            typeof value === 'object' ? JSON.stringify(value) : value,
+            180,
+        );
+    }
+    let chatToken = '';
+    try {
+        chatToken = context().chatId ? hash(String(context().chatId)).slice(0, 10) : '';
+    } catch {
+        chatToken = '';
+    }
+    const entry = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        time: Date.now(),
+        level: ['success', 'warning', 'error'].includes(level) ? level : 'info',
+        event: safeDiagnosticText(event, 60),
+        title: safeDiagnosticText(title, 120),
+        detail: safeDiagnosticText(detail, 320),
+        version: VERSION,
+        chatToken,
+        counts: diagnosticMemorySnapshot(),
+        metadata: safeMetadata,
+    };
+    writeDiagnosticLog([...readDiagnosticLog(), entry]);
+    return entry;
+}
+
+function diagnosticLevelLabel(level) {
+    return {
+        success: '成功',
+        warning: '注意',
+        error: '失败',
+        info: '记录',
+    }[level] || '记录';
+}
+
+function diagnosticTime(value) {
+    const date = new Date(Number(value) || Date.now());
+    return date.toLocaleString([], {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+    });
+}
+
+function formatDiagnosticLog() {
+    const entries = readDiagnosticLog();
+    const settings = pluginSettings();
+    let endpoint = '未配置';
+    try {
+        endpoint = settings.directApiUrl ? new URL(normalizeDirectApiUrl(settings.directApiUrl)).host : '未配置';
+    } catch {
+        endpoint = '自定义接口';
+    }
+    const lines = [
+        'Krystal · 卷轴记忆诊断日志',
+        `插件版本：v${VERSION}`,
+        `记录数量：${entries.length}/${MAX_DIAGNOSTIC_LOGS}`,
+        `工作模式：${settings.captureMode}`,
+        `模型：${safeDiagnosticText(settings.directModel || selectedProfile()?.name || '未配置', 100)}`,
+        `接口主机：${safeDiagnosticText(endpoint, 120)}`,
+        `敏感抽象：${settings.sensitiveAbstraction ? '开启' : '关闭'}`,
+        `设备：${safeDiagnosticText(navigator.userAgent, 220)}`,
+        '隐私：不包含 API 密钥、剧情原文或完整提示词。',
+        '',
+    ];
+    for (const entry of entries) {
+        const counts = entry.counts || {};
+        const metadata = Object.entries(entry.metadata || {})
+            .map(([key, value]) => `${key}=${value}`)
+            .join(' · ');
+        lines.push(
+            `[${diagnosticTime(entry.time)}] [${diagnosticLevelLabel(entry.level)}] ${entry.title}`,
+            entry.detail ? `  ${entry.detail}` : '',
+            `  事件：${entry.event || 'unknown'} · 记忆：短期 ${counts.short ?? 0} / 长期 ${counts.long ?? 0} / 细节 ${counts.facts ?? 0}${metadata ? ` · ${metadata}` : ''}`,
+        );
+    }
+    return lines.filter((line, index) => line || index < 10).join('\n');
+}
+
+async function copyDiagnosticLog() {
+    const text = formatDiagnosticLog();
+    try {
+        await navigator.clipboard.writeText(text);
+    } catch {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.append(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        textarea.remove();
+    }
+    showActionFeedback('诊断日志已复制');
+}
+
+function clearDiagnosticLog() {
+    writeDiagnosticLog([]);
+    diagnosticClearConfirmationOpen = false;
+    render();
+    showActionFeedback('诊断日志已清空');
+}
+
+function renderDiagnosticLog(panel) {
+    if (!diagnosticPreviewOpen) return;
+    const entries = readDiagnosticLog();
+    const meta = panel.querySelector('#ksm-diagnostic-log-meta');
+    const list = panel.querySelector('#ksm-diagnostic-log-list');
+    if (!meta || !list) return;
+    meta.textContent = `本设备最近 ${entries.length}/${MAX_DIAGNOSTIC_LOGS} 条 · 新记录会自动覆盖最旧记录 · 不含剧情原文和密钥`;
+    list.innerHTML = entries.length
+        ? [...entries].reverse().map(entry => {
+            const counts = entry.counts || {};
+            const metadata = Object.entries(entry.metadata || {})
+                .map(([key, value]) => `<span>${escapeHtml(key)}：${escapeHtml(value)}</span>`)
+                .join('');
+            return `
+                <article class="ksm-log-item is-${escapeHtml(entry.level || 'info')}">
+                    <header>
+                        <span class="ksm-log-level">${escapeHtml(diagnosticLevelLabel(entry.level))}</span>
+                        <time>${escapeHtml(diagnosticTime(entry.time))}</time>
+                    </header>
+                    <strong>${escapeHtml(entry.title || '诊断记录')}</strong>
+                    ${entry.detail ? `<p>${escapeHtml(entry.detail)}</p>` : ''}
+                    <div class="ksm-log-meta">
+                        <span>短期 ${counts.short ?? 0}</span>
+                        <span>长期 ${counts.long ?? 0}</span>
+                        <span>细节 ${counts.facts ?? 0}</span>
+                        ${metadata}
+                    </div>
+                </article>`;
+        }).join('')
+        : `<div class="ksm-empty">
+                <span class="ksm-empty-icon"><i class="fa-solid fa-stethoscope"></i></span>
+                <strong>还没有诊断记录</strong>
+                <span>下一次总结、重试、导入或更新时会自动记录。</span>
+            </div>`;
+}
+
 let panelOpen = false;
 let activeTab = 'short';
 let settingsOpen = false;
 let injectionPreviewOpen = false;
+let diagnosticPreviewOpen = false;
+let diagnosticClearConfirmationOpen = false;
+let diagnosticLogCache = null;
 let initialized = false;
 let trackRawStream = false;
 let rawStreamText = '';
@@ -385,6 +586,17 @@ function isDedicatedMode() {
 }
 
 function savePluginSettings() {
+    const settings = pluginSettings();
+    addDiagnosticLog(
+        'settings.saved',
+        '卷轴设置已保存',
+        `工作模式 ${settings.captureMode} · 敏感抽象${settings.sensitiveAbstraction ? '开启' : '关闭'}`,
+        'success',
+        {
+            模型: settings.directModel || selectedProfile()?.name || '未配置',
+            最大输出: settings.maxTokens,
+        },
+    );
     context().saveSettingsDebounced();
     updateInjection();
     render();
@@ -1402,12 +1614,25 @@ function saferRetryMessages(messages) {
 
 function requestEmptyRetryConfirmation(diagnostic) {
     lastEmptyDiagnostic = diagnostic;
+    addDiagnosticLog(
+        'api.empty.awaiting-decision',
+        'API 返回空内容，等待决定',
+        `${diagnostic.reason}；插件不会自动发送第二次请求`,
+        'warning',
+        {
+            请求序号: diagnostic.attempt,
+            HTTP: diagnostic.httpStatus,
+            结束原因: diagnostic.finishReason,
+            请求ID: diagnostic.requestId,
+        },
+    );
     if (pendingEmptyRetry?.resolve) {
         pendingEmptyRetry.resolve(false);
     }
     panelOpen = true;
     settingsOpen = false;
     injectionPreviewOpen = false;
+    diagnosticPreviewOpen = false;
     runtimeStatus.captureState = 'warning';
     runtimeStatus.captureText = `捕获：API 空回 · ${diagnostic.reason} · 等待你决定是否再次计费重试`;
     return new Promise(resolve => {
@@ -1424,6 +1649,13 @@ function settleEmptyRetry(shouldRetry) {
     runtimeStatus.captureText = shouldRetry
         ? '捕获：已确认再次请求，正在使用加强抽象重试'
         : '捕获：已停止；没有发送第二次请求';
+    addDiagnosticLog(
+        shouldRetry ? 'api.empty.retry-approved' : 'api.empty.retry-stopped',
+        shouldRetry ? '已确认第二次请求' : '已停止第二次请求',
+        shouldRetry ? '将使用加强抽象重新请求，可能再次计费' : '没有发送第二次请求',
+        shouldRetry ? 'warning' : 'success',
+        { 首次空回原因: pending.diagnostic?.reason || '未提供' },
+    );
     render();
     pending.resolve(Boolean(shouldRetry));
 }
@@ -1437,6 +1669,10 @@ function renderPersistentDialogs(panel) {
         emptyDialog.querySelector('.ksm-decision-reason').textContent
             = `${pendingEmptyRetry.diagnostic.reason}。第一笔请求可能已经计费。`;
     }
+
+    const clearDialog = panel.querySelector('#ksm-clear-diagnostics-confirm');
+    clearDialog.hidden = !diagnosticClearConfirmationOpen;
+    clearDialog.classList.toggle('is-visible', diagnosticClearConfirmationOpen);
 
     const updateDialog = panel.querySelector('#ksm-update-confirm');
     updateDialog.hidden = !updateConfirmationOpen;
@@ -1455,6 +1691,19 @@ async function sendDirectRequest(messages, maxTokens = pluginSettings().maxToken
 
     const runAttempt = async (requestMessages, attempt) => {
         const startedAt = performance.now();
+        addDiagnosticLog(
+            'api.request.started',
+            '记忆 API 请求开始',
+            `独立 API · 第 ${attempt} 次请求`,
+            'info',
+            {
+                模型: settings.directModel,
+                接口: (() => {
+                    try { return new URL(apiUrl).host; } catch { return '自定义接口'; }
+                })(),
+                最大输出: maxTokens,
+            },
+        );
         const response = await fetch('/api/backends/chat-completions/generate', {
             method: 'POST',
             headers: getRequestHeaders(),
@@ -1476,26 +1725,57 @@ async function sendDirectRequest(messages, maxTokens = pluginSettings().maxToken
         try {
             data = JSON.parse(raw);
         } catch {
+            addDiagnosticLog(
+                'api.response.invalid-json',
+                'API 返回无法解析',
+                `HTTP ${response.status} · 响应不是有效 JSON`,
+                'error',
+                { 耗时毫秒: Math.round(performance.now() - startedAt) },
+            );
             throw new Error(raw || `记忆 API 返回了无法解析的内容（${response.status}）`);
         }
         if (!response.ok || data?.error) {
             const message = data?.error?.message
                 ?? data?.message
                 ?? `请求失败（${response.status}）`;
+            addDiagnosticLog(
+                'api.response.error',
+                'API 请求失败',
+                String(message),
+                'error',
+                {
+                    HTTP: response.status,
+                    请求序号: attempt,
+                    耗时毫秒: Math.round(performance.now() - startedAt),
+                },
+            );
             throw new Error(String(message));
         }
-        return {
-            data,
+        const text = directResponseText(data);
+        const diagnostic = buildEmptyDiagnostic(data, {
+            attempt,
+            model: settings.directModel,
+            apiUrl,
             response,
-            text: directResponseText(data),
-            diagnostic: buildEmptyDiagnostic(data, {
-                attempt,
-                model: settings.directModel,
-                apiUrl,
-                response,
-                elapsedMs: performance.now() - startedAt,
-            }),
-        };
+            elapsedMs: performance.now() - startedAt,
+        });
+        addDiagnosticLog(
+            text.trim() ? 'api.response.content' : 'api.response.empty',
+            text.trim() ? 'API 已返回内容' : 'API 返回空内容',
+            text.trim()
+                ? `HTTP ${response.status} · 已收到可解析文本`
+                : diagnostic.reason,
+            text.trim() ? 'success' : 'warning',
+            {
+                请求序号: attempt,
+                HTTP: response.status,
+                耗时毫秒: diagnostic.elapsedMs,
+                结束原因: diagnostic.finishReason,
+                候选数: `${diagnostic.choices}/${diagnostic.candidates}`,
+                请求ID: diagnostic.requestId,
+            },
+        );
+        return { data, response, text, diagnostic };
     };
 
     const first = await runAttempt(messages, 1);
@@ -1523,6 +1803,17 @@ async function sendProfileRequest(messages, maxTokens = pluginSettings().maxToke
     const service = connectionService();
     for (let attempt = 1; attempt <= 2; attempt++) {
         const startedAt = performance.now();
+        addDiagnosticLog(
+            'api.profile.started',
+            '连接配置请求开始',
+            `第 ${attempt} 次请求`,
+            'info',
+            {
+                配置: profile.name,
+                模型: profile.model || profile.name,
+                最大输出: maxTokens,
+            },
+        );
         const requestMessages = attempt === 1 ? messages : saferRetryMessages(messages);
         const prompt = service.constructPrompt(requestMessages, profile.id);
         const response = await service.sendRequest(
@@ -1539,15 +1830,41 @@ async function sendProfileRequest(messages, maxTokens = pluginSettings().maxToke
         const text = typeof response === 'string'
             ? response
             : response?.content ?? response?.text ?? directResponseText(response);
-        if (String(text).trim()) return { label: profile.name, text: String(text) };
+        const elapsedMs = Math.round(performance.now() - startedAt);
+        if (String(text).trim()) {
+            addDiagnosticLog(
+                'api.profile.content',
+                '连接配置已返回内容',
+                `第 ${attempt} 次请求成功`,
+                'success',
+                {
+                    配置: profile.name,
+                    模型: profile.model || profile.name,
+                    耗时毫秒: elapsedMs,
+                },
+            );
+            return { label: profile.name, text: String(text) };
+        }
 
         const responseData = response && typeof response === 'object' ? response : {};
         const diagnostic = buildEmptyDiagnostic(responseData, {
             attempt,
             model: profile.model || profile.name,
-            elapsedMs: performance.now() - startedAt,
+            elapsedMs,
         });
         lastEmptyDiagnostic = diagnostic;
+        addDiagnosticLog(
+            'api.profile.empty',
+            '连接配置返回空内容',
+            diagnostic.reason,
+            'warning',
+            {
+                请求序号: attempt,
+                模型: profile.model || profile.name,
+                耗时毫秒: elapsedMs,
+                结束原因: diagnostic.finishReason,
+            },
+        );
         if (attempt === 1) {
             const authorized = await requestEmptyRetryConfirmation(diagnostic);
             if (!authorized) {
@@ -1579,6 +1896,18 @@ async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
         return false;
     }
     detachImportedTerminalMemory();
+    addDiagnosticLog(
+        'capture.started',
+        options.reason === 'retry' || options.reason === 'repair'
+            ? '手动记忆整理开始'
+            : '自动记忆整理开始',
+        `AI 楼层 ${messageIndex + 1} · swipe ${snapshot.swipeId}`,
+        'info',
+        {
+            触发: options.generationType || options.reason || 'auto',
+            强制重算: options.force ? '是' : '否',
+        },
+    );
 
     runtimeStatus.captureState = 'working';
     runtimeStatus.captureText = '捕获：独立 API 正在整理本轮记忆';
@@ -1586,6 +1915,15 @@ async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
 
     try {
         const request = buildProfileCaptureRequest(messageIndex);
+        addDiagnosticLog(
+            request.archiveRequired ? 'archive.requested' : 'capture.requested',
+            request.archiveRequired ? '已达到归档边界' : '准备生成短期记忆',
+            request.archiveRequired
+                ? `现有短期已满，将归档 20 条并写入当前轮`
+                : `正在整理 AI 楼层 ${messageIndex + 1}`,
+            request.archiveRequired ? 'warning' : 'info',
+            { AI楼层: messageIndex + 1, swipe: snapshot.swipeId },
+        );
         const { label, text } = await sendDedicatedRequest(request.messages);
         const latest = context();
         const latestMessage = latest.chat[messageIndex];
@@ -1595,6 +1933,13 @@ async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
             || Number(latestMessage.swipe_id || 0) !== snapshot.swipeId) {
             runtimeStatus.captureState = 'warning';
             runtimeStatus.captureText = '捕获：对话或重说已变化，本次结果已丢弃';
+            addDiagnosticLog(
+                'capture.discarded',
+                '总结结果已丢弃',
+                '请求期间聊天内容或当前 swipe 发生变化',
+                'warning',
+                { AI楼层: messageIndex + 1, 原swipe: snapshot.swipeId },
+            );
             render();
             return false;
         }
@@ -1620,11 +1965,35 @@ async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
             : (replacedExistingCapture ? '自动已更新本轮总结' : '自动已新增本轮总结');
         runtimeStatus.captureState = 'success';
         runtimeStatus.captureText = `捕获：${action} · 独立 API（${label}）· 当前短期 ${currentState.short.length}/${MAX_SHORT} · 本轮细节 ${capture.facts.length}`;
+        addDiagnosticLog(
+            request.archiveRequired ? 'archive.completed' : 'capture.completed',
+            request.archiveRequired ? '长期归档与本轮总结完成' : action,
+            `AI 楼层 ${messageIndex + 1} · 短期输出 ${capture.short.length} · 长期输出 ${capture.long.length} · 细节操作 ${capture.facts.length}`,
+            'success',
+            {
+                模型: label,
+                AI楼层: messageIndex + 1,
+                swipe: snapshot.swipeId,
+                当前短期: `${currentState.short.length}/${MAX_SHORT}`,
+                当前长期: `${currentState.long.length}/${MAX_LONG}`,
+            },
+        );
         render();
         return true;
     } catch (error) {
         runtimeStatus.captureState = 'error';
         runtimeStatus.captureText = `捕获：独立 API 失败 · ${error.message}`;
+        addDiagnosticLog(
+            'capture.failed',
+            '记忆整理失败',
+            error.message,
+            'error',
+            {
+                AI楼层: messageIndex + 1,
+                swipe: snapshot.swipeId,
+                触发: options.generationType || options.reason || 'auto',
+            },
+        );
         console.error('[Krystal Scroll Memory] Dedicated capture failed', error);
         toastr.error(`卷轴记忆捕获失败：${error.message}`);
         render();
@@ -1712,6 +2081,13 @@ function scheduleProfileCapture(messageIndex, generationType = 'normal', delay =
         const force = ['swipe', 'regenerate', 'continue', 'append', 'appendFinal']
             .includes(String(generationType));
         hideMemoryInMessage(resolvedIndex);
+        addDiagnosticLog(
+            'capture.scheduled',
+            '已触发自动总结',
+            `AI 楼层 ${resolvedIndex + 1} · swipe ${Number(message.swipe_id || 0)}`,
+            'info',
+            { 生成类型: generationType, 强制重算: force ? '是' : '否' },
+        );
         void queueProfileCapture(resolvedIndex, {
             force,
             reason: 'auto',
@@ -1727,6 +2103,7 @@ function clearScheduledProfileCaptures() {
 }
 
 async function testProfileConnection() {
+    addDiagnosticLog('connection.test.started', '连接测试开始', '将发送一条最小测试请求', 'info');
     try {
         await saveVisibleConfiguration({ notify: false });
         runtimeStatus.captureState = 'working';
@@ -1738,10 +2115,12 @@ async function testProfileConnection() {
         ], 32);
         runtimeStatus.captureState = 'success';
         runtimeStatus.captureText = `捕获：独立 API 已就绪 · ${label}`;
+        addDiagnosticLog('connection.test.completed', '连接测试成功', `模型或配置：${label}`, 'success');
         toastr.success(`记忆 API 连接成功：${label}`);
     } catch (error) {
         runtimeStatus.captureState = 'error';
         runtimeStatus.captureText = `捕获：连接测试失败 · ${error.message}`;
+        addDiagnosticLog('connection.test.failed', '连接测试失败', error.message, 'error');
         toastr.error(`记忆 API 测试失败：${error.message}`);
     }
     render();
@@ -1790,6 +2169,12 @@ async function bootstrapFactsFromMemory() {
         return false;
     }
     factBootstrapRunning = true;
+    addDiagnosticLog(
+        'facts.bootstrap.started',
+        '细节整理开始',
+        `将从长期 ${data.long.length} 条、短期 ${data.short.length} 条记忆中整理`,
+        'info',
+    );
     runtimeStatus.captureState = 'working';
     runtimeStatus.captureText = '捕获：正在从现有记忆整理细节事实';
     render();
@@ -1808,12 +2193,20 @@ async function bootstrapFactsFromMemory() {
         activeTab = 'facts';
         runtimeStatus.captureState = 'success';
         runtimeStatus.captureText = `捕获：细节整理完成 · 独立 API（${label}）· ${state().facts.length} 条`;
+        addDiagnosticLog(
+            'facts.bootstrap.completed',
+            '细节整理完成',
+            `当前有效细节 ${state().facts.length} 条`,
+            'success',
+            { 模型: label, 返回细节: facts.length },
+        );
         toastr.success(`已从现有记忆整理 ${state().facts.length} 条细节事实`);
         render();
         return true;
     } catch (error) {
         runtimeStatus.captureState = 'error';
         runtimeStatus.captureText = `捕获：细节整理失败 · ${error.message}`;
+        addDiagnosticLog('facts.bootstrap.failed', '细节整理失败', error.message, 'error');
         toastr.error(`细节记忆整理失败：${error.message}`);
         render();
         return false;
@@ -2092,6 +2485,13 @@ function captureMessage(messageIndex, generationType) {
         runtimeStatus.captureText = rawStreamText
             ? '捕获：AI 回复里没有完整记忆标签'
             : '捕获：未收到标签；若关闭了流式输出，美化正则也可能已将其删除';
+        addDiagnosticLog(
+            'capture.inline.missing',
+            '正文兼容模式未找到记忆标签',
+            runtimeStatus.captureText.replace(/^捕获：/, ''),
+            'warning',
+            { AI楼层: messageIndex + 1, 触发: generationType || 'unknown' },
+        );
         return false;
     }
 
@@ -2100,6 +2500,13 @@ function captureMessage(messageIndex, generationType) {
     if (archiveRequired && !capture.long.length) {
         runtimeStatus.captureState = 'warning';
         runtimeStatus.captureText = '捕获：短期记忆已满，但本轮缺少长期归档标签';
+        addDiagnosticLog(
+            'archive.inline.missing',
+            '归档标签缺失',
+            '短期记忆已满，但本轮回复没有完整长期记忆区块',
+            'warning',
+            { AI楼层: messageIndex + 1 },
+        );
         return false;
     }
 
@@ -2110,6 +2517,13 @@ function captureMessage(messageIndex, generationType) {
     });
     runtimeStatus.captureState = 'success';
     runtimeStatus.captureText = `捕获：成功 · ${source} · 短期 ${capture.short.length} / 长期 ${capture.long.length} / 细节 ${capture.facts.length}`;
+    addDiagnosticLog(
+        archiveRequired ? 'archive.inline.completed' : 'capture.inline.completed',
+        archiveRequired ? '正文标签归档完成' : '正文标签捕获成功',
+        `AI 楼层 ${messageIndex + 1} · 短期 ${capture.short.length} · 长期 ${capture.long.length} · 细节 ${capture.facts.length}`,
+        'success',
+        { 来源: source, 触发: generationType || 'unknown' },
+    );
     return true;
 }
 
@@ -2287,6 +2701,12 @@ async function checkForPluginUpdate({ notify = false } = {}) {
     if (updateRuntime.checking || updateRuntime.updating) return;
     updateRuntime.checking = true;
     updateRuntime.message = '正在检查 GitHub 新版本…';
+    addDiagnosticLog(
+        'update.check.started',
+        notify ? '手动检查插件更新' : '后台检查插件更新',
+        `当前版本 v${VERSION}`,
+        'info',
+    );
     render();
     try {
         const controller = new AbortController();
@@ -2310,6 +2730,12 @@ async function checkForPluginUpdate({ notify = false } = {}) {
         updateRuntime.message = updateRuntime.available
             ? `发现 v${latest} · 可以在这里直接更新`
             : `当前 v${VERSION} · 已是最新版本`;
+        addDiagnosticLog(
+            updateRuntime.available ? 'update.check.available' : 'update.check.current',
+            updateRuntime.available ? '发现插件新版本' : '插件已是最新版本',
+            `当前 v${VERSION} · 远端 v${latest}`,
+            updateRuntime.available ? 'warning' : 'success',
+        );
         if (notify) {
             showActionFeedback(updateRuntime.available
                 ? `发现新版本 v${latest}`
@@ -2317,6 +2743,7 @@ async function checkForPluginUpdate({ notify = false } = {}) {
         }
     } catch (error) {
         updateRuntime.message = `检查失败 · ${error.message}`;
+        addDiagnosticLog('update.check.failed', '检查插件更新失败', error.message, 'error');
         if (notify) showActionFeedback(`检查更新失败：${error.message}`, 'error', 2600);
     } finally {
         updateRuntime.checking = false;
@@ -2361,6 +2788,12 @@ async function performPluginUpdate() {
     updateConfirmationOpen = false;
     updateRuntime.updating = true;
     updateRuntime.message = '正在通过酒馆更新卷轴记忆…';
+    addDiagnosticLog(
+        'update.install.started',
+        '插件更新开始',
+        `将从 v${VERSION} 更新到 v${updateRuntime.latest || '最新版本'}`,
+        'warning',
+    );
     render();
     try {
         const folder = extensionFolderName();
@@ -2382,15 +2815,23 @@ async function performPluginUpdate() {
             updateRuntime.available = false;
             updateRuntime.latest = VERSION;
             updateRuntime.message = `当前 v${VERSION} · 已是最新版本`;
+            addDiagnosticLog('update.install.current', '酒馆确认插件已是最新版本', `v${VERSION}`, 'success');
             showActionFeedback('卷轴记忆已经是最新版本');
             return;
         }
         updateRuntime.available = false;
         updateRuntime.message = `更新成功 · ${result?.shortCommitHash || '正在刷新'}`;
+        addDiagnosticLog(
+            'update.install.completed',
+            '插件更新成功',
+            `提交 ${result?.shortCommitHash || '未提供'} · 页面即将刷新`,
+            'success',
+        );
         showActionFeedback('更新成功，正在刷新页面…', 'success', 0);
         window.setTimeout(() => window.location.reload(), 1000);
     } catch (error) {
         updateRuntime.message = `更新失败 · ${error.message}`;
+        addDiagnosticLog('update.install.failed', '插件更新失败', error.message, 'error');
         showActionFeedback(`更新失败：${error.message}`, 'error', 3200);
         toastr.error(`卷轴记忆更新失败：${error.message}`);
     } finally {
@@ -2418,7 +2859,8 @@ function renderSettings(panel) {
     const checkUpdateButton = panel.querySelector('[data-action="check-update"]');
     const performUpdateButton = panel.querySelector('[data-action="request-update"]');
     const diagnosticStatus = panel.querySelector('#ksm-diagnostic-status');
-    const copyDiagnosticButton = panel.querySelector('[data-action="copy-empty-diagnostic"]');
+    const viewDiagnosticButton = panel.querySelector('[data-action="open-diagnostics"]');
+    const copyDiagnosticButton = panel.querySelector('[data-action="copy-diagnostic-log"]');
     const saveButton = panel.querySelector('[data-action="save-settings"]');
     const testButton = panel.querySelector('[data-action="test-profile"]');
     const profileExists = profiles.some(item => item.id === settings.connectionProfileId);
@@ -2469,10 +2911,13 @@ function renderSettings(panel) {
     performUpdateButton.hidden = !updateRuntime.available;
     performUpdateButton.disabled = updateRuntime.updating;
     performUpdateButton.querySelector('span').textContent = updateRuntime.updating ? '更新中…' : '立即更新';
-    diagnosticStatus.textContent = lastEmptyDiagnostic
-        ? `最近一次：${lastEmptyDiagnostic.reason} · 第 ${lastEmptyDiagnostic.attempt} 次请求`
-        : '暂无空回诊断';
-    copyDiagnosticButton.disabled = !lastEmptyDiagnostic;
+    const diagnosticEntries = readDiagnosticLog();
+    const latestDiagnostic = diagnosticEntries.at(-1);
+    diagnosticStatus.textContent = latestDiagnostic
+        ? `已记录 ${diagnosticEntries.length}/${MAX_DIAGNOSTIC_LOGS} 条 · 最近：${latestDiagnostic.title}`
+        : '还没有诊断记录';
+    viewDiagnosticButton.disabled = !diagnosticEntries.length;
+    copyDiagnosticButton.disabled = !diagnosticEntries.length;
 }
 
 function renderInjectionPreview(panel) {
@@ -2657,10 +3102,23 @@ function confirmPendingDelete() {
         : persistMemoryItemChange(item, kind, 'delete');
     hideDeleteConfirmation();
     if (!persisted) {
+        addDiagnosticLog(
+            'memory.delete.failed',
+            '删除记忆失败',
+            '目标来自未迁移的旧标签，无法持久修改',
+            'error',
+            { 类型: kind, 标签: label },
+        );
         toastr.warning('这条记忆来自未迁移的旧标签，暂时无法持久修改');
         showActionFeedback('删除失败：这条旧记忆暂时无法修改', 'error', 2600);
         return;
     }
+    addDiagnosticLog(
+        'memory.delete.completed',
+        '已删除一条记忆',
+        `${kind} · ${label}`,
+        'success',
+    );
     render();
     showActionFeedback(`已删除：${label}`);
 }
@@ -2678,6 +3136,7 @@ function render() {
     panel.classList.toggle('ksm-open', panelOpen);
     panel.classList.toggle('ksm-settings-open', settingsOpen);
     panel.classList.toggle('ksm-preview-open', injectionPreviewOpen);
+    panel.classList.toggle('ksm-diagnostics-open', diagnosticPreviewOpen);
     for (const tab of panel.querySelectorAll('[data-tab]')) {
         const selected = tab.dataset.tab === activeTab;
         tab.classList.toggle('active', selected);
@@ -2727,6 +3186,7 @@ function render() {
                 </div>`);
     renderSettings(panel);
     renderInjectionPreview(panel);
+    renderDiagnosticLog(panel);
     renderPersistentDialogs(panel);
 }
 
@@ -2805,6 +3265,12 @@ function persistFactChange(item, action, nextContent = '') {
 
 function downloadJson() {
     const data = state();
+    addDiagnosticLog(
+        'memory.exported',
+        '记忆已导出',
+        `短期 ${data.short.length} · 长期 ${data.long.length} · 细节 ${data.facts.length}`,
+        'success',
+    );
     const exportItem = item => {
         const exported = {
             id: item.id,
@@ -2876,11 +3342,24 @@ function importJson(file) {
             void ctx.saveChat();
             const data = state();
             if (data.baselineStatus === 'stale') {
+                addDiagnosticLog(
+                    'memory.imported.stale',
+                    '旧档已导入但来源变化',
+                    `短期 ${data.short.length} · 长期 ${data.long.length} · 细节 ${data.facts.length}`,
+                    'warning',
+                );
                 toastr.warning('旧档已导入，但原聊天楼层与导出时不同；请重新导出旧档后再生成一次');
             } else {
+                addDiagnosticLog(
+                    'memory.imported',
+                    '记忆旧档导入成功',
+                    `短期 ${data.short.length} · 长期 ${data.long.length} · 细节 ${data.facts.length}`,
+                    'success',
+                );
                 toastr.success(`旧档已固定导入，并接管末轮重说（短期 ${data.short.length} / 长期 ${data.long.length} / 细节 ${data.facts.length}）`);
             }
         } catch (error) {
+            addDiagnosticLog('memory.import.failed', '记忆导入失败', error.message, 'error');
             toastr.error(`导入失败：${error.message}`);
         }
     };
@@ -2929,6 +3408,13 @@ async function retryLastCapture() {
         toastr.warning('当前聊天还没有可整理的 AI 回复');
         return;
     }
+    addDiagnosticLog(
+        'capture.retry.clicked',
+        '已点击重试本轮',
+        `准备处理最近 AI 楼层 ${messageIndex + 1}`,
+        'info',
+        { 工作模式: pluginSettings().captureMode },
+    );
     const detached = detachImportedTerminalMemory();
     if (detached.detached) rebuildFromChat();
     if (isDedicatedMode()) {
@@ -3100,10 +3586,13 @@ function mountUi() {
                 </p>
                 <div class="ksm-diagnostic-card">
                     <span>
-                        <strong>空回诊断</strong>
-                        <small id="ksm-diagnostic-status">暂无空回诊断</small>
+                        <strong>诊断日志</strong>
+                        <small id="ksm-diagnostic-status">还没有诊断记录</small>
                     </span>
-                    <button data-action="copy-empty-diagnostic" disabled><i class="fa-solid fa-copy"></i><span>复制诊断</span></button>
+                    <span class="ksm-diagnostic-actions">
+                        <button data-action="open-diagnostics" disabled><i class="fa-solid fa-stethoscope"></i><span>查看日志</span></button>
+                        <button data-action="copy-diagnostic-log" disabled><i class="fa-solid fa-copy"></i><span>复制</span></button>
+                    </span>
                 </div>
                 <label class="ksm-setting-row">
                     <span>最大输出</span>
@@ -3130,6 +3619,22 @@ function mountUi() {
                     <button data-action="close-injection"><i class="fa-solid fa-arrow-left"></i><span>返回</span></button>
                 </div>
             </section>
+            <section id="ksm-diagnostic-preview" aria-label="诊断日志">
+                <div class="ksm-section-heading">
+                    <span class="ksm-section-icon"><i class="fa-solid fa-stethoscope"></i></span>
+                    <span><h3>诊断日志</h3><small>总结、归档、重说与操作记录</small></span>
+                </div>
+                <p id="ksm-diagnostic-log-meta" class="ksm-preview-meta"></p>
+                <div id="ksm-diagnostic-log-list" aria-live="polite"></div>
+                <p class="ksm-setting-help ksm-setting-help-wide">
+                    日志只保存在当前设备，最多 60 条；不会写入聊天、记忆导出或提示词，也不记录 API 密钥和剧情原文。Windows 的 Git Credential Manager 属于酒馆外部进程，不在此日志范围内。
+                </p>
+                <div class="ksm-settings-actions">
+                    <button data-action="copy-diagnostic-log"><i class="fa-solid fa-copy"></i><span>复制全部</span></button>
+                    <button data-action="request-clear-diagnostics" class="ksm-log-clear"><i class="fa-solid fa-trash-can"></i><span>清空日志</span></button>
+                    <button data-action="close-diagnostics"><i class="fa-solid fa-arrow-left"></i><span>返回设置</span></button>
+                </div>
+            </section>
             <div id="ksm-action-feedback" class="ksm-action-feedback" role="status" aria-live="polite" hidden>
                 <i class="fa-solid fa-circle-check" aria-hidden="true"></i>
                 <span class="ksm-action-feedback-copy">操作完成</span>
@@ -3140,6 +3645,17 @@ function mountUi() {
                     <button data-action="cancel-delete">取消</button>
                     <button data-action="confirm-delete" class="ksm-confirm-danger">确认删除</button>
                 </span>
+            </div>
+            <div id="ksm-clear-diagnostics-confirm" class="ksm-decision-dialog" role="alertdialog" aria-modal="true" aria-label="清空诊断日志确认" hidden>
+                <div class="ksm-decision-card">
+                    <span class="ksm-decision-icon ksm-decision-warning"><i class="fa-solid fa-trash-can"></i></span>
+                    <h4>清空本机诊断日志？</h4>
+                    <p class="ksm-decision-reason">最近的诊断记录会从当前设备移除，无法恢复。</p>
+                    <div class="ksm-decision-actions">
+                        <button data-action="cancel-clear-diagnostics"><span>取消</span></button>
+                        <button data-action="confirm-clear-diagnostics" class="ksm-confirm-danger"><i class="fa-solid fa-trash-can"></i><span>确认清空</span></button>
+                    </div>
+                </div>
             </div>
             <div id="ksm-empty-retry-confirm" class="ksm-decision-dialog" role="alertdialog" aria-modal="true" aria-label="空回重试确认" hidden>
                 <div class="ksm-decision-card">
@@ -3212,6 +3728,38 @@ function mountUi() {
             return;
         }
         const action = button.dataset.action;
+        if (action === 'open-diagnostics') {
+            settingsOpen = false;
+            injectionPreviewOpen = false;
+            diagnosticPreviewOpen = true;
+            render();
+            return;
+        }
+        if (action === 'close-diagnostics') {
+            diagnosticPreviewOpen = false;
+            settingsOpen = true;
+            render();
+            return;
+        }
+        if (action === 'copy-diagnostic-log') {
+            void copyDiagnosticLog();
+            return;
+        }
+        if (action === 'request-clear-diagnostics') {
+            diagnosticClearConfirmationOpen = true;
+            render();
+            return;
+        }
+        if (action === 'cancel-clear-diagnostics') {
+            diagnosticClearConfirmationOpen = false;
+            render();
+            showActionFeedback('已保留诊断日志');
+            return;
+        }
+        if (action === 'confirm-clear-diagnostics') {
+            clearDiagnosticLog();
+            return;
+        }
         if (action === 'copy-empty-diagnostic') {
             void copyLastEmptyDiagnostic();
             return;
@@ -3249,9 +3797,11 @@ function mountUi() {
         if (action === 'settings') {
             settingsOpen = !settingsOpen;
             injectionPreviewOpen = false;
+            diagnosticPreviewOpen = false;
         }
         if (action === 'view-injection') {
             settingsOpen = false;
+            diagnosticPreviewOpen = false;
             injectionPreviewOpen = true;
         }
         if (action === 'close-injection') injectionPreviewOpen = false;
@@ -3303,6 +3853,7 @@ function mountUi() {
         if (action === 'retry-last') void retryLastCapture();
         if (action === 'bootstrap-facts') void bootstrapFactsFromMemory();
         if (action === 'rebuild' && confirm('将根据当前聊天中保存的记忆标签重建侧栏，继续吗？')) {
+            addDiagnosticLog('memory.rebuild.manual', '手动重建开始', '将按当前聊天底片重算侧栏', 'info');
             showActionFeedback('正在重建当前记忆…', 'working', 0);
             rebuildFromChat();
             showActionFeedback('当前记忆已重建');
@@ -3325,9 +3876,22 @@ function mountUi() {
                     ? persistFactChange(item, 'save', article.querySelector('textarea').value)
                     : persistMemoryItemChange(item, activeTab, 'save', article.querySelector('textarea').value);
                 if (!persisted) {
+                    addDiagnosticLog(
+                        'memory.save.failed',
+                        '保存记忆失败',
+                        '目标来自未迁移的旧标签，无法持久修改',
+                        'error',
+                        { 类型: activeTab, 标签: label },
+                    );
                     toastr.warning('这条记忆来自未迁移的旧标签，暂时无法持久修改');
                     showActionFeedback('保存失败：这条旧记忆暂时无法修改', 'error', 2600);
                 } else {
+                    addDiagnosticLog(
+                        'memory.save.completed',
+                        '手动修改已保存',
+                        `${activeTab} · ${label}`,
+                        'success',
+                    );
                     showActionFeedback(`已保存：${label}`);
                 }
             }
@@ -3423,6 +3987,7 @@ function registerEvents() {
     ].filter(Boolean).forEach(event => ctx.eventSource.on(event, render));
     ctx.eventSource.on(events.CHAT_CHANGED, () => {
         generationInProgress = false;
+        addDiagnosticLog('chat.changed', '已切换聊天', '正在核对当前聊天的记忆底片', 'info');
         clearScheduledProfileCaptures();
         refreshCurrentChatState();
         updateInjection();
@@ -3488,6 +4053,14 @@ function registerEvents() {
         ctx.eventSource.on(events.MESSAGE_SWIPED, (messageIndex, meta = {}) => {
             const detached = detachImportedTerminalMemory();
             const index = resolveAssistantMessageIndex(messageIndex);
+            const selected = context().chat[index];
+            addDiagnosticLog(
+                'chat.swipe.changed',
+                '已切换 AI 重说版本',
+                `AI 楼层 ${index + 1} · 当前 swipe ${Number(selected?.swipe_id || 0)}`,
+                'info',
+                { 等待生成: meta?.pendingGeneration ? '是' : '否' },
+            );
             const message = context().chat[index];
             if (message && !message.is_user) syncCaptureFromCurrentSwipe(message);
             rebuildFromChat();
@@ -3506,11 +4079,23 @@ function registerEvents() {
     [events.MESSAGE_DELETED, events.MESSAGE_UPDATED]
         .filter(Boolean)
         .forEach(event => ctx.eventSource.on(event, () => {
+            addDiagnosticLog(
+                'chat.structure.changed',
+                '聊天楼层发生变化',
+                '正在按当前楼层重新计算记忆',
+                'warning',
+            );
             rebuildFromChat();
             window.setTimeout(hideAllMemoryBlocks, 50);
         }));
     if (events.MESSAGE_EDITED) {
         ctx.eventSource.on(events.MESSAGE_EDITED, messageIndex => {
+            addDiagnosticLog(
+                'chat.message.edited',
+                '聊天内容已编辑',
+                `楼层 ${Number(messageIndex) + 1} 的旧底片将失效`,
+                'warning',
+            );
             const detached = detachImportedTerminalMemory();
             if (detached.detached) rebuildFromChat();
             const message = context().chat[Number(messageIndex)];
@@ -3532,6 +4117,12 @@ function init() {
     if (initialized) return;
     initialized = true;
     mountUi();
+    addDiagnosticLog(
+        'lifecycle.loaded',
+        '卷轴记忆已加载',
+        `v${VERSION} · 当前设备日志已启用`,
+        'success',
+    );
     registerEvents();
     refreshCurrentChatState();
     updateInjection();
