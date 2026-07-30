@@ -380,7 +380,8 @@
 
 #ksm-list,
 #ksm-settings,
-#ksm-injection-preview {
+#ksm-injection-preview,
+#ksm-diagnostic-preview {
     min-height: 0;
     overflow: auto;
     overscroll-behavior: contain;
@@ -395,7 +396,8 @@
 }
 
 #ksm-settings,
-#ksm-injection-preview {
+#ksm-injection-preview,
+#ksm-diagnostic-preview {
     display: none;
     flex: 1 1 auto;
     min-height: 220px;
@@ -409,17 +411,26 @@
 #ksm-panel.ksm-preview-open .ksm-tabs,
 #ksm-panel.ksm-preview-open .ksm-status,
 #ksm-panel.ksm-preview-open #ksm-list,
-#ksm-panel.ksm-preview-open .ksm-footer {
+#ksm-panel.ksm-preview-open .ksm-footer,
+#ksm-panel.ksm-diagnostics-open .ksm-tabs,
+#ksm-panel.ksm-diagnostics-open .ksm-status,
+#ksm-panel.ksm-diagnostics-open #ksm-list,
+#ksm-panel.ksm-diagnostics-open .ksm-footer {
     display: none;
 }
 
 #ksm-panel.ksm-settings-open #ksm-settings,
-#ksm-panel.ksm-preview-open #ksm-injection-preview {
+#ksm-panel.ksm-preview-open #ksm-injection-preview,
+#ksm-panel.ksm-diagnostics-open #ksm-diagnostic-preview {
     display: block;
 }
 
 #ksm-panel.ksm-settings-open #ksm-injection-preview,
-#ksm-panel.ksm-preview-open #ksm-settings {
+#ksm-panel.ksm-settings-open #ksm-diagnostic-preview,
+#ksm-panel.ksm-preview-open #ksm-settings,
+#ksm-panel.ksm-preview-open #ksm-diagnostic-preview,
+#ksm-panel.ksm-diagnostics-open #ksm-settings,
+#ksm-panel.ksm-diagnostics-open #ksm-injection-preview {
     display: none;
 }
 
@@ -598,10 +609,18 @@
 }
 
 .ksm-update-copy,
-.ksm-diagnostic-card > span {
+.ksm-diagnostic-card > span:first-child {
     display: grid;
     min-width: 0;
     gap: 3px;
+}
+
+.ksm-diagnostic-actions {
+    display: flex;
+    flex: 0 0 auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
 }
 
 .ksm-update-copy strong,
@@ -640,6 +659,116 @@
     border-color: color-mix(in srgb, var(--ksm-accent) 44%, transparent);
     background: var(--ksm-surface-active);
     color: var(--ksm-emphasis);
+}
+
+
+#ksm-diagnostic-log-list {
+    display: grid;
+    gap: 9px;
+    margin: 0 0 13px;
+}
+
+.ksm-log-item {
+    position: relative;
+    padding: 11px 12px 10px;
+    overflow: hidden;
+    border: 1px solid var(--ksm-line);
+    border-radius: 13px;
+    background: var(--ksm-surface);
+    box-shadow: 0 5px 15px rgb(0 0 0 / 10%);
+}
+
+.ksm-log-item::before {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 3px;
+    background: #8a9aa7;
+    content: "";
+}
+
+.ksm-log-item.is-success::before {
+    background: #54bd7a;
+}
+
+.ksm-log-item.is-warning::before {
+    background: #e39542;
+}
+
+.ksm-log-item.is-error::before {
+    background: #e56767;
+}
+
+.ksm-log-item header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 7px;
+}
+
+.ksm-log-level {
+    display: inline-flex;
+    padding: 3px 7px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--ksm-text) 8%, transparent);
+    color: var(--ksm-muted);
+    font-size: 9px;
+    font-weight: 700;
+}
+
+.ksm-log-item.is-success .ksm-log-level {
+    background: rgb(84 189 122 / 14%);
+    color: color-mix(in srgb, #54bd7a 78%, var(--ksm-text));
+}
+
+.ksm-log-item.is-warning .ksm-log-level {
+    background: rgb(227 149 66 / 15%);
+    color: color-mix(in srgb, #e39542 78%, var(--ksm-text));
+}
+
+.ksm-log-item.is-error .ksm-log-level {
+    background: rgb(229 103 103 / 15%);
+    color: color-mix(in srgb, #e56767 78%, var(--ksm-text));
+}
+
+.ksm-log-item time {
+    color: var(--ksm-muted);
+    font-size: 9px;
+    font-variant-numeric: tabular-nums;
+}
+
+.ksm-log-item > strong {
+    display: block;
+    color: var(--ksm-text);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.ksm-log-item > p {
+    margin: 5px 0 0;
+    color: var(--ksm-muted);
+    font-size: 10px;
+    line-height: 1.55;
+}
+
+.ksm-log-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 8px;
+}
+
+.ksm-log-meta span {
+    padding: 3px 6px;
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--ksm-text) 6%, transparent);
+    color: var(--ksm-muted);
+    font-size: 9px;
+    line-height: 1.35;
+}
+
+#ksm-panel .ksm-log-clear {
+    color: color-mix(in srgb, #e56767 78%, var(--ksm-text));
 }
 
 .ksm-settings-actions {
