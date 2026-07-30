@@ -10,7 +10,7 @@ const META_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const LAUNCHER_POSITION_KEY = 'krystalScrollMemoryLauncherPosition';
 const SETTINGS_KEY = 'krystalScrollMemory';
-const VERSION = '0.3.13';
+const VERSION = '0.3.14';
 const STATE_VERSION = 3;
 const SETTINGS_VERSION = 5;
 const SOURCE_DIGEST_VERSION = 2;
@@ -314,6 +314,7 @@ let captureQueue = Promise.resolve();
 let generationInProgress = false;
 let factBootstrapRunning = false;
 let actionFeedbackTimer = 0;
+let deleteConfirmationTimer = 0;
 let pendingDelete = null;
 let pendingEmptyRetry = null;
 let lastEmptyDiagnostic = null;
@@ -3070,15 +3071,21 @@ function showActionFeedback(message, state = 'success', duration = 1800) {
 
 function hideDeleteConfirmation() {
     pendingDelete = null;
+    window.clearTimeout(deleteConfirmationTimer);
     const prompt = document.getElementById('ksm-delete-confirm');
     if (prompt) {
         prompt.classList.remove('is-visible');
-        window.setTimeout(() => { prompt.hidden = true; }, 180);
+        deleteConfirmationTimer = window.setTimeout(() => {
+            prompt.hidden = true;
+            deleteConfirmationTimer = 0;
+        }, 180);
     }
 }
 
 function requestDeleteConfirmation(item, kind, label) {
     pendingDelete = { id: item.id, kind, label };
+    window.clearTimeout(deleteConfirmationTimer);
+    deleteConfirmationTimer = 0;
     const prompt = document.getElementById('ksm-delete-confirm');
     if (!prompt) return;
     prompt.querySelector('.ksm-delete-confirm-copy').textContent = `确定删除“${label}”吗？`;
@@ -3729,6 +3736,8 @@ function mountUi() {
         }
         const action = button.dataset.action;
         if (action === 'open-diagnostics') {
+            hideDeleteConfirmation();
+            diagnosticClearConfirmationOpen = false;
             settingsOpen = false;
             injectionPreviewOpen = false;
             diagnosticPreviewOpen = true;
@@ -3795,6 +3804,7 @@ function mountUi() {
         }
         if (action === 'close') panelOpen = false;
         if (action === 'settings') {
+            hideDeleteConfirmation();
             settingsOpen = !settingsOpen;
             injectionPreviewOpen = false;
             diagnosticPreviewOpen = false;
