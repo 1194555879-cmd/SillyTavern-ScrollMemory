@@ -438,6 +438,8 @@
 #ksm-profile-settings[hidden],
 .ksm-settings-actions button[hidden],
 .ksm-update-actions button[hidden],
+.ksm-action-feedback[hidden],
+.ksm-delete-confirm[hidden],
 .ksm-decision-dialog[hidden] {
     display: none !important;
 }
@@ -1409,6 +1411,10 @@
 .ksm-delete-confirm {
     justify-content: space-between;
     border-color: color-mix(in srgb, #df6b6b 48%, var(--ksm-line));
+    pointer-events: none;
+}
+
+.ksm-delete-confirm.is-visible {
     pointer-events: auto;
 }
 
