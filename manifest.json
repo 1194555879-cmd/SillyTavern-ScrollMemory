@@ -6,7 +6,7 @@
     "js": "ui-layout.js",
     "css": "style.css",
     "author": "Krystal & Claude; SillyTavern adaptation by GPT",
-    "version": "0.3.18",
+    "version": "0.3.19",
     "homePage": "https://github.com/1194555879-cmd/SillyTavern-ScrollMemory",
     "auto_update": true
 }
