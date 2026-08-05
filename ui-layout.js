@@ -1,11 +1,19 @@
 /**
- * Krystal Scroll Memory v0.3.18 UI layout adapter.
+ * Krystal Scroll Memory v0.3.19 UI layout adapter.
  * Keeps the wand menu as one entry and moves secondary actions into the panel.
  */
 
-const COMPAT_VERSION = '0.3.18';
-const PREVIOUS_VERSION = '0.3.17';
+const COMPAT_VERSION = '0.3.19';
+const PREVIOUS_VERSIONS = ['0.3.17', '0.3.18'];
 const PANEL_ACTIONS_ID = 'ksm-panel-quick-actions';
+const WAND_ITEM_IDS = {
+    ignore: 'ksm-wand-ignore-last',
+    launcher: 'ksm-wand-launcher-toggle',
+};
+const detachedWandItems = {
+    ignore: null,
+    launcher: null,
+};
 let observer = null;
 let refreshScheduled = false;
 
@@ -15,24 +23,45 @@ function setTextIfChanged(element, text) {
     return true;
 }
 
-function secondaryWandItems() {
-    return {
-        ignore: document.getElementById('ksm-wand-ignore-last'),
-        launcher: document.getElementById('ksm-wand-launcher-toggle'),
-    };
+function rememberWandItem(kind, element) {
+    if (element) detachedWandItems[kind] = element;
+    return detachedWandItems[kind];
+}
+
+function wandItem(kind) {
+    const id = WAND_ITEM_IDS[kind];
+    const live = id ? document.getElementById(id) : null;
+    return rememberWandItem(kind, live);
+}
+
+function detachSecondaryWandItems() {
+    let changed = false;
+    for (const kind of Object.keys(WAND_ITEM_IDS)) {
+        const item = document.getElementById(WAND_ITEM_IDS[kind]);
+        if (!item) continue;
+        rememberWandItem(kind, item);
+        if (typeof item.remove === 'function') {
+            item.remove();
+        } else if (item.parentNode?.removeChild) {
+            item.parentNode.removeChild(item);
+        } else {
+            item.hidden = true;
+            item.style?.setProperty?.('display', 'none', 'important');
+        }
+        changed = true;
+    }
+    return changed;
 }
 
 function tidyWandMenu() {
-    const { ignore, launcher } = secondaryWandItems();
-    if (ignore && !ignore.hidden) ignore.hidden = true;
-    if (launcher && !launcher.hidden) launcher.hidden = true;
+    return detachSecondaryWandItems();
 }
 
 function launcherVisible() {
-    const source = document.getElementById('ksm-wand-launcher-toggle');
-    if (source) return source.getAttribute('aria-pressed') !== 'false';
     const launcher = document.getElementById('ksm-launcher');
-    return launcher?.style?.display !== 'none';
+    if (launcher) return launcher.style?.display !== 'none';
+    const source = wandItem('launcher');
+    return source ? source.getAttribute('aria-pressed') !== 'false' : true;
 }
 
 function syncPanelActions(card = document.getElementById(PANEL_ACTIONS_ID)) {
@@ -48,8 +77,8 @@ function syncPanelActions(card = document.getElementById(PANEL_ACTIONS_ID)) {
     }
 }
 
-function triggerWandAction(id) {
-    const source = document.getElementById(id);
+function triggerWandAction(kind) {
+    const source = wandItem(kind);
     if (!source) {
         globalThis.toastr?.warning?.('卷轴记忆操作尚未加载完成，请稍后再试');
         return;
@@ -81,10 +110,10 @@ function mountPanelActions() {
                 </button>
             </span>`;
         card.querySelector('[data-ksm-panel-action="ignore-last"]')?.addEventListener('click', () => {
-            triggerWandAction('ksm-wand-ignore-last');
+            triggerWandAction('ignore');
         });
         card.querySelector('[data-ksm-panel-action="toggle-launcher"]')?.addEventListener('click', () => {
-            triggerWandAction('ksm-wand-launcher-toggle');
+            triggerWandAction('launcher');
         });
         const updateCard = settings.querySelector('.ksm-update-card');
         if (updateCard) updateCard.insertAdjacentElement('afterend', card);
@@ -96,8 +125,12 @@ function mountPanelActions() {
 
 function patchVersionText() {
     document.querySelectorAll('#ksm-panel *').forEach(element => {
-        if (element.children.length || !element.textContent?.includes(`v${PREVIOUS_VERSION}`)) return;
-        setTextIfChanged(element, element.textContent.replaceAll(`v${PREVIOUS_VERSION}`, `v${COMPAT_VERSION}`));
+        if (element.children.length) return;
+        let next = element.textContent || '';
+        for (const version of PREVIOUS_VERSIONS) {
+            next = next.replaceAll(`v${version}`, `v${COMPAT_VERSION}`);
+        }
+        setTextIfChanged(element, next);
     });
 }
 
@@ -109,7 +142,7 @@ function ensureLayout() {
     if (!document.body) return;
     observer?.disconnect();
     try {
-        tidyWandMenu();
+        detachSecondaryWandItems();
         mountPanelActions();
         patchVersionText();
     } finally {
@@ -129,8 +162,8 @@ function scheduleRefresh() {
 
 async function load() {
     await import('./entry.js');
-    if (globalThis.__KSM_V0318_UI_LAYOUT__) return;
-    globalThis.__KSM_V0318_UI_LAYOUT__ = true;
+    if (globalThis.__KSM_V0319_UI_LAYOUT__) return;
+    globalThis.__KSM_V0319_UI_LAYOUT__ = true;
     observer = new MutationObserver(scheduleRefresh);
     observe();
     ensureLayout();
@@ -140,14 +173,17 @@ async function load() {
     }, true);
 }
 
-if (globalThis.__KSM_V0318_TEST_MODE__) {
-    globalThis.__KSM_V0318_TEST__ = {
+if (globalThis.__KSM_V0319_TEST_MODE__) {
+    globalThis.__KSM_V0319_TEST__ = {
+        detachSecondaryWandItems,
         launcherVisible,
         mountPanelActions,
         patchVersionText,
         setTextIfChanged,
         syncPanelActions,
         tidyWandMenu,
+        triggerWandAction,
+        wandItem,
     };
 } else {
     void load();
