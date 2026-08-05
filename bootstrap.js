@@ -1,16 +1,22 @@
 /**
  * Krystal Scroll Memory v0.3.15 compatibility bootstrap.
  *
- * Installs the truncation guard before loading the v0.3.14 core, then adds
- * SillyTavern wand-menu access and a persistent floating-launcher toggle.
+ * Loads the v0.3.14 core behind three guards:
+ * 1) incomplete/length-truncated memory output repair;
+ * 2) stale capture cleanup after deleting a chat floor;
+ * 3) SillyTavern wand-menu access, launcher visibility and ignore-last-turn.
  */
 
 const COMPAT_VERSION = '0.3.15';
 const CORE_VERSION = '0.3.14';
 const SETTINGS_KEY = 'krystalScrollMemory';
+const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const MEMORY_ENDPOINT = '/api/backends/chat-completions/generate';
 const REMOTE_MANIFEST_PART = '/1194555879-cmd/SillyTavern-ScrollMemory/main/manifest.json';
 const MIN_MEMORY_OUTPUT_TOKENS = 4000;
+
+let clearNextAssistantCapture = false;
+let chatGuardsInstalled = false;
 
 function getContextSafe() {
     try {
@@ -221,6 +227,10 @@ function openMemoryPanel() {
         toast('warning', '卷轴记忆界面尚未加载完成');
         return;
     }
+    if (!launcherIsVisible()) {
+        saveLauncherVisibility(true);
+        applyLauncherVisibility();
+    }
     launcher.click();
     closeWandMenu();
 }
@@ -230,6 +240,102 @@ function toggleLauncher() {
     saveLauncherVisibility(visible);
     applyLauncherVisibility();
     toast('success', visible ? '卷轴记忆悬浮球已开启' : '卷轴记忆悬浮球已关闭，可从魔法棒菜单重新打开');
+}
+
+function latestAssistantMessageIndex(ctx = getContextSafe()) {
+    if (!ctx?.chat) return -1;
+    for (let index = ctx.chat.length - 1; index >= 0; index--) {
+        const message = ctx.chat[index];
+        if (message && !message.is_user && !message.is_system) return index;
+    }
+    return -1;
+}
+
+function resolveAssistantMessageIndex(messageIndex, ctx = getContextSafe()) {
+    const numeric = Number(messageIndex);
+    if (Number.isInteger(numeric)) {
+        const candidate = ctx?.chat?.[numeric];
+        if (candidate && !candidate.is_user && !candidate.is_system) return numeric;
+    }
+    return latestAssistantMessageIndex(ctx);
+}
+
+function clearMessageCapture(message) {
+    if (!message) return false;
+    let changed = false;
+    if (message.extra?.[MESSAGE_META_KEY]) {
+        delete message.extra[MESSAGE_META_KEY];
+        changed = true;
+    }
+    const swipeId = Number(message.swipe_id);
+    if (Number.isInteger(swipeId) && message.swipe_info?.[swipeId]?.extra?.[MESSAGE_META_KEY]) {
+        delete message.swipe_info[swipeId].extra[MESSAGE_META_KEY];
+        changed = true;
+    }
+    return changed;
+}
+
+async function emitMessageUpdated(index) {
+    const ctx = getContextSafe();
+    const events = ctx?.eventTypes || ctx?.event_types;
+    if (!ctx || !events) return;
+    if (events.MESSAGE_UPDATED && typeof ctx.eventSource?.emit === 'function') {
+        await ctx.eventSource.emit(events.MESSAGE_UPDATED, index);
+    }
+}
+
+async function ignoreLatestCapture() {
+    const ctx = getContextSafe();
+    const index = latestAssistantMessageIndex(ctx);
+    if (index < 0) {
+        toast('warning', '当前聊天还没有可忽略的 AI 楼层');
+        return;
+    }
+    const message = ctx.chat[index];
+    const changed = clearMessageCapture(message);
+    if (!changed) {
+        toast('info', '最近一轮本来就没有记忆底片');
+        closeWandMenu();
+        return;
+    }
+    await emitMessageUpdated(index).catch(() => null);
+    await ctx.saveChat?.().catch?.(() => null);
+    closeWandMenu();
+    toast('success', `已忽略最近一轮记忆（AI 楼层 ${index + 1}）`);
+}
+
+function installChatGuards() {
+    if (chatGuardsInstalled) return true;
+    const ctx = getContextSafe();
+    const events = ctx?.eventTypes || ctx?.event_types;
+    if (!ctx?.eventSource || !events) return false;
+
+    if (events.MESSAGE_DELETED) {
+        ctx.eventSource.on(events.MESSAGE_DELETED, () => {
+            clearNextAssistantCapture = true;
+        });
+    }
+
+    if (events.MESSAGE_RECEIVED) {
+        ctx.eventSource.on(events.MESSAGE_RECEIVED, (messageIndex, generationType) => {
+            if (!clearNextAssistantCapture || generationType === 'first_message') return;
+            const current = getContextSafe();
+            const index = resolveAssistantMessageIndex(messageIndex, current);
+            const message = current?.chat?.[index];
+            if (!message || message.is_user) return;
+            clearMessageCapture(message);
+            clearNextAssistantCapture = false;
+        });
+    }
+
+    if (events.CHAT_CHANGED) {
+        ctx.eventSource.on(events.CHAT_CHANGED, () => {
+            clearNextAssistantCapture = false;
+        });
+    }
+
+    chatGuardsInstalled = true;
+    return true;
 }
 
 function mountWandMenu() {
@@ -243,6 +349,10 @@ function mountWandMenu() {
         <div id="ksm-wand-open" class="list-group-item flex-container flexGap5 interactable" role="button" tabindex="0">
             <div class="fa-solid fa-scroll extensionsMenuExtensionButton"></div>
             <span>卷轴记忆</span>
+        </div>
+        <div id="ksm-wand-ignore-last" class="list-group-item flex-container flexGap5 interactable" role="button" tabindex="0">
+            <div class="fa-solid fa-comment-slash extensionsMenuExtensionButton"></div>
+            <span>忽略最近一轮记忆</span>
         </div>
         <div id="ksm-wand-launcher-toggle" class="list-group-item flex-container flexGap5 interactable" role="button" tabindex="0" aria-pressed="true">
             <div class="fa-solid fa-eye extensionsMenuExtensionButton"></div>
@@ -259,6 +369,7 @@ function mountWandMenu() {
         });
     };
     bindActivation(container.querySelector('#ksm-wand-open'), openMemoryPanel);
+    bindActivation(container.querySelector('#ksm-wand-ignore-last'), () => void ignoreLatestCapture());
     bindActivation(container.querySelector('#ksm-wand-launcher-toggle'), toggleLauncher);
     applyLauncherVisibility();
     return true;
@@ -289,8 +400,8 @@ function installClipboardVersionPatch() {
                 : text,
         );
     } catch {
-        // Some WebViews expose a read-only Clipboard object. UI functionality
-        // remains intact; only copied diagnostic headers keep the core version.
+        // Some WebViews expose a read-only Clipboard object. Only the copied
+        // diagnostic header then keeps the core version; functionality remains.
     }
 }
 
@@ -302,9 +413,8 @@ function installFetchGuard() {
     globalThis.fetch = async (input, init = {}) => {
         const url = requestUrl(input);
 
-        // The v0.3.14 core compares its internal constant with the remote
-        // manifest. Hide the compatibility wrapper's version from that one
-        // internal check to prevent a self-update loop.
+        // The core still contains v0.3.14 internally. Hide the wrapper version
+        // from its own background update check to prevent a permanent loop.
         if (String(url).includes(REMOTE_MANIFEST_PART)) {
             const response = await originalFetch(input, init);
             try {
@@ -338,13 +448,14 @@ function installFetchGuard() {
 
         const firstText = responseText(firstData);
         const needsArchive = archiveRequired(guardedBody);
-        const incomplete = !captureIsComplete(firstText, needsArchive);
-        const truncated = finishReason(firstData).includes('length')
-            || finishReason(firstData).includes('max_token');
-        if (!incomplete && !truncated) return firstResponse;
+        if (captureIsComplete(firstText, needsArchive)) return firstResponse;
 
+        const reason = finishReason(firstData);
+        const reasonHint = reason.includes('length') || reason.includes('max_token')
+            ? '检测到输出达到长度上限。'
+            : '检测到记忆边界标签不完整。';
         const approved = globalThis.confirm(
-            '卷轴记忆输出被截断或缺少完整标签。\n\n是否发送一次“压缩格式修复”请求？这可能产生第二次 API 计费。\n\n取消后不会再次请求，本轮会保留为捕获失败，之后可手动重试。',
+            `${reasonHint}\n\n是否发送一次“压缩格式修复”请求？这可能产生第二次 API 计费。\n\n取消后不会再次请求，本轮会保留为捕获失败，之后可手动重试。`,
         );
         if (!approved) return firstResponse;
 
@@ -386,13 +497,30 @@ function installFetchGuard() {
     };
 }
 
-installFetchGuard();
-installClipboardVersionPatch();
-globalThis.__KSM_COMPAT_VERSION__ = COMPAT_VERSION;
+async function waitForContext(timeoutMs = 5000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+        if (getContextSafe()) return true;
+        await new Promise(resolve => window.setTimeout(resolve, 50));
+    }
+    return false;
+}
 
-void import('./index.js')
-    .then(() => installUiEnhancements())
-    .catch(error => {
+async function load() {
+    installFetchGuard();
+    installClipboardVersionPatch();
+    globalThis.__KSM_COMPAT_VERSION__ = COMPAT_VERSION;
+
+    await waitForContext();
+    installChatGuards();
+
+    try {
+        await import('./index.js');
+        installUiEnhancements();
+    } catch (error) {
         console.error('[Krystal Scroll Memory] Failed to load core module', error);
         toast('error', `卷轴记忆加载失败：${error.message}`);
-    });
+    }
+}
+
+void load();
