@@ -1,10 +1,11 @@
 /**
  * Krystal Scroll Memory v0.3.15 compatibility bootstrap.
  *
- * Loads the v0.3.14 core behind three guards:
+ * Loads the v0.3.14 core behind four guards:
  * 1) incomplete/length-truncated memory output repair;
- * 2) stale capture cleanup after deleting a chat floor;
- * 3) SillyTavern wand-menu access, launcher visibility and ignore-last-turn.
+ * 2) always summarize the currently selected swipe text;
+ * 3) stale capture cleanup after reroll, user edits and floor deletion;
+ * 4) SillyTavern wand-menu access, launcher visibility and ignore-last-turn.
  */
 
 const COMPAT_VERSION = '0.3.15';
@@ -14,8 +15,9 @@ const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
 const MEMORY_ENDPOINT = '/api/backends/chat-completions/generate';
 const REMOTE_MANIFEST_PART = '/1194555879-cmd/SillyTavern-ScrollMemory/main/manifest.json';
 const MIN_MEMORY_OUTPUT_TOKENS = 4000;
+const MEMORY_BLOCK_RE = /【长期记忆条目】[\s\S]*?【长期记忆完】|【记忆条目】[\s\S]*?【记忆完】|【细节记忆】[\s\S]*?【细节记忆完】/g;
 
-let clearNextAssistantCapture = false;
+let invalidateNextAssistantCapture = false;
 let chatGuardsInstalled = false;
 
 function getContextSafe() {
@@ -47,9 +49,7 @@ function saveLauncherVisibility(visible) {
 
 function toast(type, message) {
     const api = globalThis.toastr;
-    if (api && typeof api[type] === 'function') {
-        api[type](message);
-    }
+    if (api && typeof api[type] === 'function') api[type](message);
 }
 
 function requestUrl(input) {
@@ -68,15 +68,118 @@ function parseRequestBody(init) {
 }
 
 function isMemoryCaptureRequest(url, body) {
-    if (!String(url).includes(MEMORY_ENDPOINT) || !body || !Array.isArray(body.messages)) {
-        return false;
-    }
+    if (!String(url).includes(MEMORY_ENDPOINT) || !body || !Array.isArray(body.messages)) return false;
     return body.messages.some(message => {
         const content = String(message?.content || '');
         return content.includes('你是独立的剧情记忆整理器')
             || content.includes('【记忆总结要求】')
             || content.includes('【待归档短期记忆】');
     });
+}
+
+function selectedMessageText(message) {
+    const swipeId = Number(message?.swipe_id);
+    const swipeText = Number.isInteger(swipeId) && Array.isArray(message?.swipes)
+        ? message.swipes[swipeId]
+        : undefined;
+    return typeof swipeText === 'string' ? swipeText : String(message?.mes || '');
+}
+
+function stripMemoryBlocks(text) {
+    MEMORY_BLOCK_RE.lastIndex = 0;
+    return String(text || '').replace(MEMORY_BLOCK_RE, '').trim();
+}
+
+function abstractSensitiveSource(value) {
+    let text = String(value || '');
+    const sensitivePattern = /(性行为|性爱|亲热|做爱|性交|插入|抽插|射精|内射|射入|射了|高潮|阴茎|龟头|阴道|阴蒂|乳头|精液|爱液|口交|肛交|自慰|勃起|湿透|体液|下体|性器官|肉棒|阳具|蜜穴|花穴|后穴|淫液|深喉|舔舐|吮吸|含弄|吞咽|抽送|挺入|顶入|泄出|orgasm|cum|ejaculat|blowjob|handjob|penetrat|cock|dick|pussy|anal sex|oral sex|fuck)/i;
+    if (!sensitivePattern.test(text)) return text;
+    const replacements = [
+        [/(内射|射入(?:体内|里面)?|射在(?:体内|里面))/gi, '亲密行为结束且存在体内遗留风险'],
+        [/(射精|射了|高潮|泄出|orgasm|ejaculat(?:e|ed|ion)?|\bcum\b)/gi, '达到高潮'],
+        [/(插入|抽插|性交|做爱|性行为|性爱|penetrat(?:e|ed|ion)?|\bfuck(?:ing|ed)?\b)/gi, '发生亲密行为'],
+        [/(口交|肛交|自慰|深喉|blowjob|handjob|anal sex|oral sex)/gi, '特定亲密行为'],
+        [/(阴茎|龟头|阴道|阴蒂|乳头|下体|性器官|肉棒|阳具|蜜穴|花穴|后穴|cock|dick|pussy)/gi, '私密部位'],
+        [/(精液|爱液|淫液|体液)/gi, '身体分泌物'],
+        [/(勃起|湿透)/gi, '出现明确生理反应'],
+        [/(舔舐|吮吸|含弄|吞咽|抽送|挺入|顶入)/gi, '进行亲密接触'],
+    ];
+    for (const [pattern, replacement] of replacements) text = text.replace(pattern, replacement);
+    return text;
+}
+
+function latestAssistantMessageIndex(ctx = getContextSafe()) {
+    if (!ctx?.chat) return -1;
+    for (let index = ctx.chat.length - 1; index >= 0; index--) {
+        const message = ctx.chat[index];
+        if (message && !message.is_user && !message.is_system) return index;
+    }
+    return -1;
+}
+
+function resolveAssistantMessageIndex(messageIndex, ctx = getContextSafe()) {
+    const numeric = Number(messageIndex);
+    if (Number.isInteger(numeric)) {
+        const candidate = ctx?.chat?.[numeric];
+        if (candidate && !candidate.is_user && !candidate.is_system) return numeric;
+    }
+    return latestAssistantMessageIndex(ctx);
+}
+
+function nextAssistantMessageIndex(userIndex, ctx = getContextSafe()) {
+    if (!ctx?.chat) return -1;
+    for (let index = Number(userIndex) + 1; index < ctx.chat.length; index++) {
+        const message = ctx.chat[index];
+        if (!message) continue;
+        if (message.is_user) break;
+        if (!message.is_system) return index;
+    }
+    return -1;
+}
+
+function currentTurnText(ctx, assistantIndex) {
+    if (!ctx?.chat?.[assistantIndex]) return '';
+    let turnStart = 0;
+    for (let index = assistantIndex - 1; index >= 0; index--) {
+        const candidate = ctx.chat[index];
+        if (candidate && !candidate.is_user && !candidate.is_system) {
+            turnStart = index + 1;
+            break;
+        }
+    }
+    const sensitive = getPluginSettings()?.sensitiveAbstraction !== false;
+    return ctx.chat
+        .slice(turnStart, assistantIndex + 1)
+        .filter(message => message && !message.is_system)
+        .map(message => {
+            const role = message.is_user ? 'user' : 'assistant';
+            const speaker = message.name || (message.is_user ? (ctx.name1 || 'user') : (ctx.name2 || 'char'));
+            const source = stripMemoryBlocks(selectedMessageText(message)).slice(-16000);
+            const content = sensitive ? abstractSensitiveSource(source) : source;
+            return `【${role}｜${speaker}】\n${content}`;
+        })
+        .join('\n\n');
+}
+
+function rewriteRequestWithCurrentSwipe(body) {
+    const ctx = getContextSafe();
+    const assistantIndex = latestAssistantMessageIndex(ctx);
+    const currentTurn = currentTurnText(ctx, assistantIndex);
+    if (!currentTurn) return body;
+
+    let changed = false;
+    const messages = body.messages.map(message => {
+        if (message?.role !== 'user' || !String(message.content || '').includes('【本轮对话】')) return message;
+        const content = String(message.content || '');
+        const replaced = content.replace(
+            /【本轮对话】\n[\s\S]*?\n\n【前文参考/,
+            `【本轮对话】\n${currentTurn}\n\n【前文参考`,
+        );
+        if (replaced === content) return message;
+        changed = true;
+        return { ...message, content: replaced };
+    });
+    return changed ? { ...body, messages } : body;
 }
 
 function responseText(data) {
@@ -88,9 +191,7 @@ function responseText(data) {
         ?? data?.content
         ?? '';
     if (Array.isArray(content)) {
-        return content
-            .map(part => typeof part === 'string' ? part : (part?.text ?? part?.content ?? ''))
-            .join('');
+        return content.map(part => typeof part === 'string' ? part : (part?.text ?? part?.content ?? '')).join('');
     }
     return String(content || '');
 }
@@ -154,23 +255,19 @@ function closePartialBlock(text, start, end) {
     const startIndex = text.indexOf(start);
     if (startIndex < 0 || text.indexOf(end, startIndex + start.length) >= 0) return text;
     const content = text.slice(startIndex + start.length).trim();
-    if (!content) return text;
-    return `${text.trim()}\n${end}`;
+    return content ? `${text.trim()}\n${end}` : text;
 }
 
 function salvageCaptureText(text, needsArchive) {
     let repaired = String(text || '').trim();
     if (!repaired) return '';
-
     if (needsArchive) repaired = closePartialBlock(repaired, '【长期记忆条目】', '【长期记忆完】');
     repaired = closePartialBlock(repaired, '【记忆条目】', '【记忆完】');
-
     if (!repaired.includes('【细节记忆】')) {
         repaired += '\n【细节记忆】\n无\n【细节记忆完】';
     } else {
         repaired = closePartialBlock(repaired, '【细节记忆】', '【细节记忆完】');
     }
-
     return captureIsComplete(repaired, needsArchive) ? repaired : '';
 }
 
@@ -194,6 +291,108 @@ function cloneResponse(data, response) {
     });
 }
 
+function clearMessageCapture(message) {
+    if (!message) return false;
+    let changed = false;
+    if (message.extra?.[MESSAGE_META_KEY]) {
+        delete message.extra[MESSAGE_META_KEY];
+        changed = true;
+    }
+    const swipeId = Number(message.swipe_id);
+    if (Number.isInteger(swipeId) && message.swipe_info?.[swipeId]?.extra?.[MESSAGE_META_KEY]) {
+        delete message.swipe_info[swipeId].extra[MESSAGE_META_KEY];
+        changed = true;
+    }
+    return changed;
+}
+
+async function emitMessageUpdated(index) {
+    const ctx = getContextSafe();
+    const events = ctx?.eventTypes || ctx?.event_types;
+    if (events?.MESSAGE_UPDATED && typeof ctx?.eventSource?.emit === 'function') {
+        await ctx.eventSource.emit(events.MESSAGE_UPDATED, index);
+    }
+}
+
+function invalidateCaptureAt(index, persist = false) {
+    const ctx = getContextSafe();
+    const message = ctx?.chat?.[index];
+    const changed = clearMessageCapture(message);
+    if (changed) {
+        void emitMessageUpdated(index).catch(() => null);
+        if (persist) void ctx.saveChat?.().catch?.(() => null);
+    }
+    return changed;
+}
+
+async function ignoreLatestCapture() {
+    const ctx = getContextSafe();
+    const index = latestAssistantMessageIndex(ctx);
+    if (index < 0) {
+        toast('warning', '当前聊天还没有可忽略的 AI 楼层');
+        return;
+    }
+    if (!invalidateCaptureAt(index, true)) {
+        toast('info', '最近一轮本来就没有记忆底片');
+    } else {
+        toast('success', `已忽略最近一轮记忆（AI 楼层 ${index + 1}）`);
+    }
+    closeWandMenu();
+}
+
+function installChatGuards() {
+    if (chatGuardsInstalled) return true;
+    const ctx = getContextSafe();
+    const events = ctx?.eventTypes || ctx?.event_types;
+    if (!ctx?.eventSource || !events) return false;
+
+    if (events.GENERATION_AFTER_COMMANDS) {
+        ctx.eventSource.on(events.GENERATION_AFTER_COMMANDS, (generationType, _options, dryRun) => {
+            if (dryRun) return;
+            if (!['swipe', 'regenerate'].includes(String(generationType))) return;
+            const index = latestAssistantMessageIndex();
+            if (index >= 0) invalidateCaptureAt(index);
+            invalidateNextAssistantCapture = true;
+        });
+    }
+
+    if (events.MESSAGE_EDITED) {
+        ctx.eventSource.on(events.MESSAGE_EDITED, messageIndex => {
+            const current = getContextSafe();
+            const index = Number(messageIndex);
+            const edited = current?.chat?.[index];
+            const target = edited?.is_user ? nextAssistantMessageIndex(index, current) : index;
+            if (target >= 0) invalidateCaptureAt(target);
+            if (edited?.is_user) invalidateNextAssistantCapture = true;
+        });
+    }
+
+    if (events.MESSAGE_DELETED) {
+        ctx.eventSource.on(events.MESSAGE_DELETED, () => {
+            invalidateNextAssistantCapture = true;
+        });
+    }
+
+    if (events.MESSAGE_RECEIVED) {
+        ctx.eventSource.on(events.MESSAGE_RECEIVED, (messageIndex, generationType) => {
+            if (!invalidateNextAssistantCapture || generationType === 'first_message') return;
+            const current = getContextSafe();
+            const index = resolveAssistantMessageIndex(messageIndex, current);
+            if (index >= 0) invalidateCaptureAt(index);
+            invalidateNextAssistantCapture = false;
+        });
+    }
+
+    if (events.CHAT_CHANGED) {
+        ctx.eventSource.on(events.CHAT_CHANGED, () => {
+            invalidateNextAssistantCapture = false;
+        });
+    }
+
+    chatGuardsInstalled = true;
+    return true;
+}
+
 function patchVersionText(root = document) {
     root.querySelectorAll('#ksm-panel *').forEach(element => {
         if (element.children.length || !element.textContent?.includes(`v${CORE_VERSION}`)) return;
@@ -204,16 +403,14 @@ function patchVersionText(root = document) {
 function applyLauncherVisibility() {
     const launcher = document.getElementById('ksm-launcher');
     if (launcher) launcher.style.display = launcherIsVisible() ? '' : 'none';
-
     const toggle = document.getElementById('ksm-wand-launcher-toggle');
-    if (toggle) {
-        const visible = launcherIsVisible();
-        toggle.setAttribute('aria-pressed', String(visible));
-        const icon = toggle.querySelector('.extensionsMenuExtensionButton');
-        if (icon) icon.className = `fa-solid ${visible ? 'fa-eye' : 'fa-eye-slash'} extensionsMenuExtensionButton`;
-        const label = toggle.querySelector('span');
-        if (label) label.textContent = `卷轴悬浮球：${visible ? '开' : '关'}`;
-    }
+    if (!toggle) return;
+    const visible = launcherIsVisible();
+    toggle.setAttribute('aria-pressed', String(visible));
+    const icon = toggle.querySelector('.extensionsMenuExtensionButton');
+    if (icon) icon.className = `fa-solid ${visible ? 'fa-eye' : 'fa-eye-slash'} extensionsMenuExtensionButton`;
+    const label = toggle.querySelector('span');
+    if (label) label.textContent = `卷轴悬浮球：${visible ? '开' : '关'}`;
 }
 
 function closeWandMenu() {
@@ -242,124 +439,23 @@ function toggleLauncher() {
     toast('success', visible ? '卷轴记忆悬浮球已开启' : '卷轴记忆悬浮球已关闭，可从魔法棒菜单重新打开');
 }
 
-function latestAssistantMessageIndex(ctx = getContextSafe()) {
-    if (!ctx?.chat) return -1;
-    for (let index = ctx.chat.length - 1; index >= 0; index--) {
-        const message = ctx.chat[index];
-        if (message && !message.is_user && !message.is_system) return index;
-    }
-    return -1;
-}
-
-function resolveAssistantMessageIndex(messageIndex, ctx = getContextSafe()) {
-    const numeric = Number(messageIndex);
-    if (Number.isInteger(numeric)) {
-        const candidate = ctx?.chat?.[numeric];
-        if (candidate && !candidate.is_user && !candidate.is_system) return numeric;
-    }
-    return latestAssistantMessageIndex(ctx);
-}
-
-function clearMessageCapture(message) {
-    if (!message) return false;
-    let changed = false;
-    if (message.extra?.[MESSAGE_META_KEY]) {
-        delete message.extra[MESSAGE_META_KEY];
-        changed = true;
-    }
-    const swipeId = Number(message.swipe_id);
-    if (Number.isInteger(swipeId) && message.swipe_info?.[swipeId]?.extra?.[MESSAGE_META_KEY]) {
-        delete message.swipe_info[swipeId].extra[MESSAGE_META_KEY];
-        changed = true;
-    }
-    return changed;
-}
-
-async function emitMessageUpdated(index) {
-    const ctx = getContextSafe();
-    const events = ctx?.eventTypes || ctx?.event_types;
-    if (!ctx || !events) return;
-    if (events.MESSAGE_UPDATED && typeof ctx.eventSource?.emit === 'function') {
-        await ctx.eventSource.emit(events.MESSAGE_UPDATED, index);
-    }
-}
-
-async function ignoreLatestCapture() {
-    const ctx = getContextSafe();
-    const index = latestAssistantMessageIndex(ctx);
-    if (index < 0) {
-        toast('warning', '当前聊天还没有可忽略的 AI 楼层');
-        return;
-    }
-    const message = ctx.chat[index];
-    const changed = clearMessageCapture(message);
-    if (!changed) {
-        toast('info', '最近一轮本来就没有记忆底片');
-        closeWandMenu();
-        return;
-    }
-    await emitMessageUpdated(index).catch(() => null);
-    await ctx.saveChat?.().catch?.(() => null);
-    closeWandMenu();
-    toast('success', `已忽略最近一轮记忆（AI 楼层 ${index + 1}）`);
-}
-
-function installChatGuards() {
-    if (chatGuardsInstalled) return true;
-    const ctx = getContextSafe();
-    const events = ctx?.eventTypes || ctx?.event_types;
-    if (!ctx?.eventSource || !events) return false;
-
-    if (events.MESSAGE_DELETED) {
-        ctx.eventSource.on(events.MESSAGE_DELETED, () => {
-            clearNextAssistantCapture = true;
-        });
-    }
-
-    if (events.MESSAGE_RECEIVED) {
-        ctx.eventSource.on(events.MESSAGE_RECEIVED, (messageIndex, generationType) => {
-            if (!clearNextAssistantCapture || generationType === 'first_message') return;
-            const current = getContextSafe();
-            const index = resolveAssistantMessageIndex(messageIndex, current);
-            const message = current?.chat?.[index];
-            if (!message || message.is_user) return;
-            clearMessageCapture(message);
-            clearNextAssistantCapture = false;
-        });
-    }
-
-    if (events.CHAT_CHANGED) {
-        ctx.eventSource.on(events.CHAT_CHANGED, () => {
-            clearNextAssistantCapture = false;
-        });
-    }
-
-    chatGuardsInstalled = true;
-    return true;
-}
-
 function mountWandMenu() {
     const menu = document.getElementById('extensionsMenu');
     if (!menu || document.getElementById('ksm_wand_container')) return false;
-
     const container = document.createElement('div');
     container.id = 'ksm_wand_container';
     container.className = 'extension_container';
     container.innerHTML = `
         <div id="ksm-wand-open" class="list-group-item flex-container flexGap5 interactable" role="button" tabindex="0">
-            <div class="fa-solid fa-scroll extensionsMenuExtensionButton"></div>
-            <span>卷轴记忆</span>
+            <div class="fa-solid fa-scroll extensionsMenuExtensionButton"></div><span>卷轴记忆</span>
         </div>
         <div id="ksm-wand-ignore-last" class="list-group-item flex-container flexGap5 interactable" role="button" tabindex="0">
-            <div class="fa-solid fa-comment-slash extensionsMenuExtensionButton"></div>
-            <span>忽略最近一轮记忆</span>
+            <div class="fa-solid fa-comment-slash extensionsMenuExtensionButton"></div><span>忽略最近一轮记忆</span>
         </div>
         <div id="ksm-wand-launcher-toggle" class="list-group-item flex-container flexGap5 interactable" role="button" tabindex="0" aria-pressed="true">
-            <div class="fa-solid fa-eye extensionsMenuExtensionButton"></div>
-            <span>卷轴悬浮球：开</span>
+            <div class="fa-solid fa-eye extensionsMenuExtensionButton"></div><span>卷轴悬浮球：开</span>
         </div>`;
     menu.append(container);
-
     const bindActivation = (element, handler) => {
         element.addEventListener('click', handler);
         element.addEventListener('keydown', event => {
@@ -400,8 +496,7 @@ function installClipboardVersionPatch() {
                 : text,
         );
     } catch {
-        // Some WebViews expose a read-only Clipboard object. Only the copied
-        // diagnostic header then keeps the core version; functionality remains.
+        // Read-only Clipboard in some WebViews only affects the copied header.
     }
 }
 
@@ -412,9 +507,6 @@ function installFetchGuard() {
 
     globalThis.fetch = async (input, init = {}) => {
         const url = requestUrl(input);
-
-        // The core still contains v0.3.14 internally. Hide the wrapper version
-        // from its own background update check to prevent a permanent loop.
         if (String(url).includes(REMOTE_MANIFEST_PART)) {
             const response = await originalFetch(input, init);
             try {
@@ -426,14 +518,13 @@ function installFetchGuard() {
             }
         }
 
-        const body = parseRequestBody(init);
-        if (!isMemoryCaptureRequest(url, body)) {
-            return originalFetch(input, init);
-        }
+        const parsedBody = parseRequestBody(init);
+        if (!isMemoryCaptureRequest(url, parsedBody)) return originalFetch(input, init);
 
+        const currentBody = rewriteRequestWithCurrentSwipe(parsedBody);
         const guardedBody = {
-            ...body,
-            max_tokens: Math.max(Number(body.max_tokens) || 0, MIN_MEMORY_OUTPUT_TOKENS),
+            ...currentBody,
+            max_tokens: Math.max(Number(currentBody.max_tokens) || 0, MIN_MEMORY_OUTPUT_TOKENS),
         };
         const guardedInit = { ...init, body: JSON.stringify(guardedBody) };
         const firstResponse = await originalFetch(input, guardedInit);
@@ -462,17 +553,11 @@ function installFetchGuard() {
         toast('info', '正在进行一次压缩格式修复重试…');
         const retryBody = {
             ...guardedBody,
-            messages: [
-                ...guardedBody.messages,
-                { role: 'user', content: compactRetryMessage(needsArchive) },
-            ],
+            messages: [...guardedBody.messages, { role: 'user', content: compactRetryMessage(needsArchive) }],
             max_tokens: MIN_MEMORY_OUTPUT_TOKENS,
             temperature: 0.1,
         };
-        const retryResponse = await originalFetch(input, {
-            ...guardedInit,
-            body: JSON.stringify(retryBody),
-        });
+        const retryResponse = await originalFetch(input, { ...guardedInit, body: JSON.stringify(retryBody) });
         if (!retryResponse.ok) return retryResponse;
 
         let retryData;
@@ -486,7 +571,6 @@ function installFetchGuard() {
             toast('success', '压缩格式修复成功，本轮记忆已交回插件保存');
             return retryResponse;
         }
-
         const salvaged = salvageCaptureText(retryText, needsArchive);
         if (salvaged && setResponseText(retryData, salvaged)) {
             toast('warning', '修复输出仍被截断，已安全闭合现有记忆标签；请稍后检查摘要内容');
@@ -510,10 +594,8 @@ async function load() {
     installFetchGuard();
     installClipboardVersionPatch();
     globalThis.__KSM_COMPAT_VERSION__ = COMPAT_VERSION;
-
     await waitForContext();
     installChatGuards();
-
     try {
         await import('./index.js');
         installUiEnhancements();
