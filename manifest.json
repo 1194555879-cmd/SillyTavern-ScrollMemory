@@ -3,7 +3,7 @@
     "loading_order": 50,
     "requires": [],
     "optional": [],
-    "js": "bootstrap.js",
+    "js": "prebootstrap.js",
     "css": "style.css",
     "author": "Krystal & Claude; SillyTavern adaptation by GPT",
     "version": "0.3.15",
