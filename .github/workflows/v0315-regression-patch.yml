@@ -1,0 +1,443 @@
+name: Apply v0.3.15 regression patch
+
+on:
+  push:
+    branches:
+      - fix/v0.3.15-truncation-wand-launcher
+    paths:
+      - .github/workflows/v0315-regression-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fix branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/v0.3.15-truncation-wand-launcher
+          fetch-depth: 0
+
+      - name: Patch bootstrap and add regression tests
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import json
+          import re
+
+          bootstrap = Path('bootstrap.js')
+          text = bootstrap.read_text(encoding='utf-8')
+
+          old_state = "let invalidateNextAssistantCapture = false;\nlet chatGuardsInstalled = false;"
+          new_state = "let pendingAssistantCaptureInvalidation = null;\nlet chatGuardsInstalled = false;"
+          if old_state not in text:
+              raise SystemExit('state marker not found')
+          text = text.replace(old_state, new_state, 1)
+
+          turn_block = r'''function normalizeTurnText(value) {
+              return String(value || '')
+                  .replace(/\r\n?/g, '\n')
+                  .replace(/[ \t]+\n/g, '\n')
+                  .replace(/\n{3,}/g, '\n\n')
+                  .trim();
+          }
+
+          function currentTurnText(ctx, assistantIndex, options = {}) {
+              if (!ctx?.chat?.[assistantIndex]) return '';
+              let turnStart = 0;
+              for (let index = assistantIndex - 1; index >= 0; index--) {
+                  const candidate = ctx.chat[index];
+                  if (candidate && !candidate.is_user && !candidate.is_system) {
+                      turnStart = index + 1;
+                      break;
+                  }
+              }
+              const sensitive = getPluginSettings()?.sensitiveAbstraction !== false;
+              const useSelectedSwipe = options.selectedSwipe !== false;
+              return ctx.chat
+                  .slice(turnStart, assistantIndex + 1)
+                  .filter(message => message && !message.is_system)
+                  .map((message, offset) => {
+                      const messageIndex = turnStart + offset;
+                      const role = message.is_user ? 'user' : 'assistant';
+                      const speaker = message.name || (message.is_user ? (ctx.name1 || 'user') : (ctx.name2 || 'char'));
+                      const sourceText = messageIndex === assistantIndex && typeof options.assistantText === 'string'
+                          ? options.assistantText
+                          : (useSelectedSwipe ? selectedMessageText(message) : String(message?.mes || ''));
+                      const source = stripMemoryBlocks(sourceText).slice(-16000);
+                      const content = sensitive ? abstractSensitiveSource(source) : source;
+                      return `【${role}｜${speaker}】\n${content}`;
+                  })
+                  .join('\n\n');
+          }
+
+          function requestCurrentTurn(body) {
+              for (const message of body?.messages || []) {
+                  if (message?.role !== 'user') continue;
+                  const match = String(message.content || '').match(
+                      /【本轮对话】\n([\s\S]*?)\n\n【前文参考/,
+                  );
+                  if (match) return normalizeTurnText(match[1]);
+              }
+              return '';
+          }
+
+          function assistantSourceVariants(message) {
+              const variants = [String(message?.mes || ''), selectedMessageText(message)];
+              if (Array.isArray(message?.swipes)) variants.push(...message.swipes);
+              return [...new Set(variants.filter(value => typeof value === 'string'))];
+          }
+
+          function requestedAssistantText(turnText) {
+              const matches = [...String(turnText || '').matchAll(
+                  /【assistant｜[^】]+】\n([\s\S]*?)(?=\n\n【(?:user|assistant)｜|$)/g,
+              )];
+              return normalizeTurnText(matches.at(-1)?.[1] || '');
+          }
+
+          function normalizedAssistantSource(value) {
+              const sensitive = getPluginSettings()?.sensitiveAbstraction !== false;
+              const source = stripMemoryBlocks(value).slice(-16000);
+              return normalizeTurnText(sensitive ? abstractSensitiveSource(source) : source);
+          }
+
+          function resolveRequestAssistantIndex(body, ctx = getContextSafe()) {
+              const requestedTurn = requestCurrentTurn(body);
+              if (!ctx?.chat || !requestedTurn || requestedTurn === '无') return -1;
+
+              const exactMatches = new Set();
+              for (let index = 0; index < ctx.chat.length; index++) {
+                  const message = ctx.chat[index];
+                  if (!message || message.is_user || message.is_system) continue;
+                  for (const variant of assistantSourceVariants(message)) {
+                      const candidate = normalizeTurnText(currentTurnText(ctx, index, {
+                          selectedSwipe: false,
+                          assistantText: variant,
+                      }));
+                      if (candidate === requestedTurn) exactMatches.add(index);
+                  }
+              }
+              if (exactMatches.size === 1) return [...exactMatches][0];
+              if (exactMatches.size > 1) return -1;
+
+              const requestedAssistant = requestedAssistantText(requestedTurn);
+              if (!requestedAssistant) return -1;
+              const sourceMatches = new Set();
+              for (let index = 0; index < ctx.chat.length; index++) {
+                  const message = ctx.chat[index];
+                  if (!message || message.is_user || message.is_system) continue;
+                  if (assistantSourceVariants(message).some(
+                      variant => normalizedAssistantSource(variant) === requestedAssistant,
+                  )) {
+                      sourceMatches.add(index);
+                  }
+              }
+              return sourceMatches.size === 1 ? [...sourceMatches][0] : -1;
+          }
+
+          function rewriteRequestWithCurrentSwipe(body) {
+              const ctx = getContextSafe();
+              const assistantIndex = resolveRequestAssistantIndex(body, ctx);
+              if (assistantIndex < 0) return body;
+              const currentTurn = currentTurnText(ctx, assistantIndex, { selectedSwipe: true });
+              if (!currentTurn) return body;
+
+              let changed = false;
+              const messages = body.messages.map(message => {
+                  if (message?.role !== 'user' || !String(message.content || '').includes('【本轮对话】')) return message;
+                  const content = String(message.content || '');
+                  const replaced = content.replace(
+                      /【本轮对话】\n[\s\S]*?\n\n【前文参考/,
+                      `【本轮对话】\n${currentTurn}\n\n【前文参考`,
+                  );
+                  if (replaced === content) return message;
+                  changed = true;
+                  return { ...message, content: replaced };
+              });
+              return changed ? { ...body, messages } : body;
+          }
+
+          '''
+          turn_pattern = re.compile(
+              r"function currentTurnText\(ctx, assistantIndex\) \{[\s\S]*?\n\}\n\n"
+              r"function rewriteRequestWithCurrentSwipe\(body\) \{[\s\S]*?\n\}\n\n"
+              r"(?=function responseText)",
+          )
+          text, count = turn_pattern.subn(lambda _: turn_block, text, count=1)
+          if count != 1:
+              raise SystemExit(f'turn rewrite block replacements: {count}')
+
+          guard_block = r'''function chatIdentity(ctx = getContextSafe()) {
+              return String(ctx?.chatId ?? ctx?.chat_id ?? '');
+          }
+
+          function armAssistantCaptureInvalidation(reason) {
+              const ctx = getContextSafe();
+              pendingAssistantCaptureInvalidation = {
+                  chatId: chatIdentity(ctx),
+                  reason: String(reason || 'unknown'),
+              };
+          }
+
+          function installChatGuards() {
+              if (chatGuardsInstalled) return true;
+              const ctx = getContextSafe();
+              const events = ctx?.eventTypes || ctx?.event_types;
+              if (!ctx?.eventSource || !events) return false;
+
+              if (events.GENERATION_AFTER_COMMANDS) {
+                  ctx.eventSource.on(events.GENERATION_AFTER_COMMANDS, (generationType, _options, dryRun) => {
+                      if (dryRun) return;
+                      if (!['swipe', 'regenerate'].includes(String(generationType))) return;
+                      const index = latestAssistantMessageIndex();
+                      if (index >= 0) invalidateCaptureAt(index, true);
+                      armAssistantCaptureInvalidation(generationType);
+                  });
+              }
+
+              if (events.MESSAGE_EDITED) {
+                  ctx.eventSource.on(events.MESSAGE_EDITED, messageIndex => {
+                      const current = getContextSafe();
+                      const index = Number(messageIndex);
+                      const edited = current?.chat?.[index];
+                      const target = edited?.is_user ? nextAssistantMessageIndex(index, current) : index;
+                      if (target >= 0) invalidateCaptureAt(target, true);
+                      if (edited?.is_user) armAssistantCaptureInvalidation('user-edit');
+                  });
+              }
+
+              if (events.MESSAGE_DELETED) {
+                  ctx.eventSource.on(events.MESSAGE_DELETED, () => {
+                      armAssistantCaptureInvalidation('message-delete');
+                  });
+              }
+
+              if (events.MESSAGE_RECEIVED) {
+                  ctx.eventSource.on(events.MESSAGE_RECEIVED, (messageIndex, generationType) => {
+                      const pending = pendingAssistantCaptureInvalidation;
+                      if (!pending) return;
+                      const current = getContextSafe();
+                      const currentChatId = chatIdentity(current);
+                      if (pending.chatId && currentChatId && pending.chatId !== currentChatId) {
+                          pendingAssistantCaptureInvalidation = null;
+                          return;
+                      }
+                      if (generationType === 'first_message') {
+                          pendingAssistantCaptureInvalidation = null;
+                          return;
+                      }
+                      const index = resolveAssistantMessageIndex(messageIndex, current);
+                      if (index >= 0) invalidateCaptureAt(index, true);
+                      pendingAssistantCaptureInvalidation = null;
+                  });
+              }
+
+              if (events.CHAT_CHANGED) {
+                  ctx.eventSource.on(events.CHAT_CHANGED, () => {
+                      if (!pendingAssistantCaptureInvalidation) return;
+                      const currentChatId = chatIdentity();
+                      if (!pendingAssistantCaptureInvalidation.chatId
+                          || !currentChatId
+                          || pendingAssistantCaptureInvalidation.chatId !== currentChatId) {
+                          pendingAssistantCaptureInvalidation = null;
+                      }
+                  });
+              }
+
+              chatGuardsInstalled = true;
+              return true;
+          }
+
+          '''
+          guard_pattern = re.compile(
+              r"function installChatGuards\(\) \{[\s\S]*?\n\}\n\n(?=function patchVersionText)",
+          )
+          text, count = guard_pattern.subn(lambda _: guard_block, text, count=1)
+          if count != 1:
+              raise SystemExit(f'chat guard replacements: {count}')
+
+          bootstrap.write_text(text, encoding='utf-8')
+
+          manifest_path = Path('manifest.json')
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          manifest['version'] = '0.3.15'
+          manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=4) + '\n', encoding='utf-8')
+
+          tests = Path('tests')
+          tests.mkdir(exist_ok=True)
+          tests.joinpath('v0.3.15-regression.cjs').write_text(r'''const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const vm = require('node:vm');
+
+          const source = fs.readFileSync('bootstrap.js', 'utf8')
+              .replace(/\nvoid load\(\);\s*$/, '\n')
+              + '\nglobalThis.__KSM_TEST__ = { rewriteRequestWithCurrentSwipe, installChatGuards };\n';
+
+          const handlers = new Map();
+          const eventSource = {
+              on(name, handler) {
+                  const list = handlers.get(name) || [];
+                  list.push(handler);
+                  handlers.set(name, list);
+              },
+              async emit(name, ...args) {
+                  for (const handler of handlers.get(name) || []) await handler(...args);
+              },
+          };
+          const eventTypes = {
+              GENERATION_AFTER_COMMANDS: 'generation-after-commands',
+              MESSAGE_EDITED: 'message-edited',
+              MESSAGE_DELETED: 'message-deleted',
+              MESSAGE_RECEIVED: 'message-received',
+              MESSAGE_UPDATED: 'message-updated',
+              CHAT_CHANGED: 'chat-changed',
+          };
+          let saves = 0;
+          let ctx = {
+              chatId: 'chat-a',
+              name1: 'user',
+              name2: 'char',
+              chat: [],
+              extensionSettings: { krystalScrollMemory: { sensitiveAbstraction: false } },
+              eventTypes,
+              eventSource,
+              saveChat: async () => { saves += 1; },
+              saveSettingsDebounced() {},
+          };
+          const sandbox = {
+              console,
+              URL,
+              Headers,
+              Response,
+              structuredClone,
+              setTimeout,
+              clearTimeout,
+              window: { setTimeout, clearTimeout },
+              navigator: { clipboard: null },
+              document: {},
+              MutationObserver: class {},
+              toastr: null,
+              confirm: () => false,
+              SillyTavern: { getContext: () => ctx },
+          };
+          sandbox.globalThis = sandbox;
+          vm.createContext(sandbox);
+          vm.runInContext(source, sandbox, { filename: 'bootstrap.js' });
+          const { rewriteRequestWithCurrentSwipe, installChatGuards } = sandbox.__KSM_TEST__;
+
+          function capture(value) {
+              return {
+                  short: [value],
+                  long: [],
+                  facts: [],
+                  capturedAt: Date.now(),
+              };
+          }
+
+          function assistant(message, swipes = [message], swipeId = 0, oldCapture = null) {
+              return {
+                  is_user: false,
+                  is_system: false,
+                  mes: message,
+                  swipes,
+                  swipe_id: swipeId,
+                  extra: oldCapture ? { krystalScrollMemoryCapture: oldCapture } : {},
+                  swipe_info: swipes.map(() => ({ extra: {} })),
+              };
+          }
+
+          function user(message) {
+              return { is_user: true, is_system: false, mes: message, extra: {} };
+          }
+
+          function requestBody(turn) {
+              return {
+                  messages: [
+                      { role: 'system', content: '你是独立的剧情记忆整理器' },
+                      {
+                          role: 'user',
+                          content: `【本轮对话】\n${turn}\n\n【前文参考，仅用于判断指代，禁止重复总结】\n无`,
+                      },
+                  ],
+              };
+          }
+
+          function promptTurn(userText, assistantText) {
+              return `【user｜user】\n${userText}\n\n【assistant｜char】\n${assistantText}`;
+          }
+
+          ctx.chat = [
+              user('旧用户楼'),
+              assistant('旧楼原 swipe', ['旧楼原 swipe', '旧楼当前 swipe'], 1),
+              user('最新用户楼'),
+              assistant('最新 AI 楼'),
+          ];
+          let rewritten = rewriteRequestWithCurrentSwipe(
+              requestBody(promptTurn('旧用户楼', '旧楼原 swipe')),
+          );
+          let rewrittenPrompt = rewritten.messages[1].content;
+          assert.match(rewrittenPrompt, /旧楼当前 swipe/);
+          assert.doesNotMatch(rewrittenPrompt, /最新 AI 楼/);
+
+          ctx.chat = [
+              user('重 roll 用户楼'),
+              assistant('重 roll 前文本', ['重 roll 前文本', '当前选中 swipe'], 1),
+          ];
+          rewritten = rewriteRequestWithCurrentSwipe(
+              requestBody(promptTurn('重 roll 用户楼', '重 roll 前文本')),
+          );
+          rewrittenPrompt = rewritten.messages[1].content;
+          assert.match(rewrittenPrompt, /当前选中 swipe/);
+          assert.doesNotMatch(rewrittenPrompt, /重 roll 前文本/);
+
+          installChatGuards();
+
+          const editCapture = capture('编辑前旧底片');
+          const editedAssistant = assistant('编辑后的下一条 AI', ['编辑后的下一条 AI'], 0, editCapture);
+          editedAssistant.swipe_info[0].extra.krystalScrollMemoryCapture = structuredClone(editCapture);
+          ctx.chat = [user('被编辑的 user'), editedAssistant];
+          await eventSource.emit(eventTypes.MESSAGE_EDITED, 0);
+          assert.equal(editedAssistant.extra.krystalScrollMemoryCapture, undefined);
+          assert.equal(editedAssistant.swipe_info[0].extra.krystalScrollMemoryCapture, undefined);
+
+          const inheritedAfterEdit = capture('编辑后错误继承');
+          editedAssistant.extra.krystalScrollMemoryCapture = inheritedAfterEdit;
+          editedAssistant.swipe_info[0].extra.krystalScrollMemoryCapture = structuredClone(inheritedAfterEdit);
+          await eventSource.emit(eventTypes.MESSAGE_RECEIVED, 1, 'normal');
+          assert.equal(editedAssistant.extra.krystalScrollMemoryCapture, undefined);
+          assert.equal(editedAssistant.swipe_info[0].extra.krystalScrollMemoryCapture, undefined);
+
+          ctx.chat = [user('删除后保留的 user')];
+          await eventSource.emit(eventTypes.MESSAGE_DELETED, 1);
+          await eventSource.emit(eventTypes.CHAT_CHANGED);
+          const inheritedAfterDelete = capture('删楼后错误继承');
+          const newAssistant = assistant('删楼后的新 AI', ['删楼后的新 AI'], 0, inheritedAfterDelete);
+          newAssistant.swipe_info[0].extra.krystalScrollMemoryCapture = structuredClone(inheritedAfterDelete);
+          ctx.chat.push(newAssistant);
+          await eventSource.emit(eventTypes.MESSAGE_RECEIVED, 1, 'normal');
+          assert.equal(newAssistant.extra.krystalScrollMemoryCapture, undefined);
+          assert.equal(newAssistant.swipe_info[0].extra.krystalScrollMemoryCapture, undefined);
+          assert.ok(saves >= 3, 'capture invalidations should be persisted');
+
+          console.log('v0.3.15 regression tests passed');
+          ''', encoding='utf-8')
+          PY
+
+      - name: Check JavaScript syntax
+        run: node --check bootstrap.js
+
+      - name: Run v0.3.15 regressions
+        run: node tests/v0.3.15-regression.cjs
+
+      - name: Commit tested patch
+        shell: bash
+        run: |
+          rm .github/workflows/v0315-regression-patch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bootstrap.js manifest.json tests/v0.3.15-regression.cjs .github/workflows/v0315-regression-patch.yml
+          git commit -m "fix: preserve target floors in v0.3.15 captures"
+          git push origin HEAD:fix/v0.3.15-truncation-wand-launcher
