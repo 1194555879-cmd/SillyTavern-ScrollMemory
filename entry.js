@@ -13,7 +13,6 @@ const COMPAT_VERSION = '0.3.20';
 const CORE_VERSION = '0.3.14';
 const SETTINGS_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
-const REMOTE_MANIFEST_PART = '/1194555879-cmd/SillyTavern-ScrollMemory/main/manifest.json';
 const MIN_MEMORY_OUTPUT_TOKENS = 4000;
 const MEMORY_BLOCK_RE = /【长期记忆条目】[\s\S]*?【长期记忆完】|【记忆条目】[\s\S]*?【记忆完】|【细节记忆】[\s\S]*?【细节记忆完】/g;
 
@@ -342,17 +341,6 @@ function installFetchGuard() {
 
     globalThis.fetch = async (input, init = {}) => {
         const url = requestUrl(input);
-        if (String(url).includes(REMOTE_MANIFEST_PART)) {
-            const response = await originalFetch(input, init);
-            try {
-                const data = await response.clone().json();
-                data.version = CORE_VERSION;
-                return cloneJsonResponse(data, response);
-            } catch {
-                return response;
-            }
-        }
-
         const parsedBody = parseRequestBody(init);
         if (!isMemoryCaptureRequest(parsedBody)) return originalFetch(input, init);
 

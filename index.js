@@ -320,12 +320,15 @@ let pendingDelete = null;
 let pendingEmptyRetry = null;
 let lastEmptyDiagnostic = null;
 let updateConfirmationOpen = false;
+function currentPluginVersion() {
+    return String(globalThis.__KSM_COMPAT_VERSION__ || VERSION);
+}
 const updateRuntime = {
     checking: false,
     updating: false,
     latest: '',
     available: false,
-    message: `当前 v${VERSION} · 尚未检查更新`,
+    message: `当前 v${currentPluginVersion()} · 尚未检查更新`,
 };
 const openFactCategories = new Set();
 const scheduledProfileCaptures = new Map();
@@ -2725,7 +2728,7 @@ async function checkForPluginUpdate({ notify = false } = {}) {
     addDiagnosticLog(
         'update.check.started',
         notify ? '手动检查插件更新' : '后台检查插件更新',
-        `当前版本 v${VERSION}`,
+        `当前版本 v${currentPluginVersion()}`,
         'info',
     );
     render();
@@ -2747,14 +2750,15 @@ async function checkForPluginUpdate({ notify = false } = {}) {
         const latest = String(remote?.version || '').trim();
         if (!latest) throw new Error('远端清单没有版本号');
         updateRuntime.latest = latest;
-        updateRuntime.available = isNewerVersion(latest, VERSION);
+        const current = currentPluginVersion();
+        updateRuntime.available = isNewerVersion(latest, current);
         updateRuntime.message = updateRuntime.available
             ? `发现 v${latest} · 可以在这里直接更新`
-            : `当前 v${VERSION} · 已是最新版本`;
+            : `当前 v${current} · 已是最新版本`;
         addDiagnosticLog(
             updateRuntime.available ? 'update.check.available' : 'update.check.current',
             updateRuntime.available ? '发现插件新版本' : '插件已是最新版本',
-            `当前 v${VERSION} · 远端 v${latest}`,
+            `当前 v${current} · 远端 v${latest}`,
             updateRuntime.available ? 'warning' : 'success',
         );
         if (notify) {
@@ -2812,7 +2816,7 @@ async function performPluginUpdate() {
     addDiagnosticLog(
         'update.install.started',
         '插件更新开始',
-        `将从 v${VERSION} 更新到 v${updateRuntime.latest || '最新版本'}`,
+        `将从 v${currentPluginVersion()} 更新到 v${updateRuntime.latest || '最新版本'}`,
         'warning',
     );
     render();
@@ -2833,10 +2837,11 @@ async function performPluginUpdate() {
         }
         const result = await response.json().catch(() => ({}));
         if (result?.isUpToDate) {
+            const current = currentPluginVersion();
             updateRuntime.available = false;
-            updateRuntime.latest = VERSION;
-            updateRuntime.message = `当前 v${VERSION} · 已是最新版本`;
-            addDiagnosticLog('update.install.current', '酒馆确认插件已是最新版本', `v${VERSION}`, 'success');
+            updateRuntime.latest = current;
+            updateRuntime.message = `当前 v${current} · 已是最新版本`;
+            addDiagnosticLog('update.install.current', '酒馆确认插件已是最新版本', `v${current}`, 'success');
             showActionFeedback('卷轴记忆已经是最新版本');
             return;
         }

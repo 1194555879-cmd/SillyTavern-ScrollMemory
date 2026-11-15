@@ -9,6 +9,9 @@ const layout = fs.readFileSync('ui-layout.js', 'utf8');
 assert.equal(manifest.version, '0.3.20');
 assert.match(entry, /const COMPAT_VERSION = '0\.3\.20'/);
 assert.match(layout, /const COMPAT_VERSION = '0\.3\.20'/);
+assert.doesNotMatch(entry, /REMOTE_MANIFEST_PART/);
+assert.match(core, /function currentPluginVersion\(\)/);
+assert.match(core, /isNewerVersion\(latest, current\)/);
 
 const editHandler = core.match(
     /if \(events\.MESSAGE_EDITED\) \{[\s\S]*?\n    \}\n    if \(events\.MORE_MESSAGES_LOADED\)/,
