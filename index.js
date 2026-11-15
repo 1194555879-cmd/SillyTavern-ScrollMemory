@@ -29,6 +29,7 @@ const DEFAULT_MAX_TOKENS = 900;
 const MIN_MAX_TOKENS = 200;
 const MAX_MAX_TOKENS = 4000;
 const EDIT_RECAPTURE_DELAY = 1000;
+const BACKFILL_REQUEST_DELAY = 800;
 const LAUNCHER_MARGIN = 8;
 const LAUNCHER_DRAG_THRESHOLD = 6;
 const SHORT_RE = /【记忆条目】([\s\S]{1,1200}?)【记忆完】/g;
@@ -320,6 +321,13 @@ let pendingDelete = null;
 let pendingEmptyRetry = null;
 let lastEmptyDiagnostic = null;
 let updateConfirmationOpen = false;
+const backfillRuntime = {
+    running: false,
+    cancelRequested: false,
+    chatId: '',
+    total: 0,
+    completed: 0,
+};
 function currentPluginVersion() {
     return String(globalThis.__KSM_COMPAT_VERSION__ || VERSION);
 }
@@ -3198,6 +3206,22 @@ function render() {
             bootstrapButton.textContent = factBootstrapRunning ? '整理中…' : '整理细节';
         }
     }
+    const backfillButton = panel.querySelector('[data-action="backfill-missing"]');
+    if (backfillButton) {
+        backfillButton.classList.toggle('is-running', backfillRuntime.running);
+        const buttonLabel = backfillButton.querySelector('.ksm-button-label');
+        if (buttonLabel) {
+            buttonLabel.textContent = backfillRuntime.running
+                ? `暂停 ${backfillRuntime.completed}/${backfillRuntime.total}`
+                : '补建遗漏';
+        }
+        const icon = backfillButton.querySelector('i');
+        if (icon) {
+            icon.className = backfillRuntime.running
+                ? 'fa-solid fa-pause'
+                : 'fa-solid fa-clock-rotate-left';
+        }
+    }
     const items = activeTab === 'short'
         ? data.short
         : (activeTab === 'long' ? data.long : data.facts);
@@ -3491,6 +3515,141 @@ async function retryLastCapture() {
     }
 }
 
+function missingCaptureIndices() {
+    const ctx = context();
+    const currentState = state();
+    const baseline = normalizeBaseline(currentState?.baseline);
+    const boundary = baseline
+        ? resolveBaselineBoundary(baseline, ctx.chat, ctx.chat.length)
+        : { startIndex: 0 };
+    const missing = [];
+    let hasUserTurn = false;
+    for (let index = 0; index < ctx.chat.length; index++) {
+        const message = ctx.chat[index];
+        if (!message) continue;
+        if (message.is_user) {
+            hasUserTurn = true;
+            continue;
+        }
+        if (index < boundary.startIndex
+            || message.is_system
+            || !hasUserTurn
+            || !String(message.mes || '').trim()
+            || readStoredCapture(message)) {
+            continue;
+        }
+        missing.push(index);
+    }
+    return missing;
+}
+
+function waitForBackfillDelay() {
+    return new Promise(resolve => window.setTimeout(resolve, BACKFILL_REQUEST_DELAY));
+}
+
+async function backfillMissingCaptures() {
+    if (backfillRuntime.running) {
+        backfillRuntime.cancelRequested = true;
+        runtimeStatus.captureText = `捕获：将在当前请求完成后暂停补建 · 已完成 ${backfillRuntime.completed}/${backfillRuntime.total}`;
+        showActionFeedback('将在当前这一轮完成后暂停', 'working', 2200);
+        render();
+        return;
+    }
+    if (!isDedicatedMode()) {
+        toastr.warning('批量补建需要使用独立 API 或酒馆连接配置模式');
+        showActionFeedback('当前模式不支持批量补建', 'error', 2600);
+        return;
+    }
+    const indices = missingCaptureIndices();
+    if (!indices.length) {
+        toastr.success('已扫描全部聊天，没有发现遗漏楼层');
+        showActionFeedback('没有发现遗漏楼层');
+        return;
+    }
+    const confirmed = window.confirm(
+        `扫描到 ${indices.length} 个没有记忆底片的 AI 楼层。\n\n`
+        + '将从最早遗漏处按剧情顺序逐轮补建，每轮会调用一次记忆 API，可能产生费用；可随时暂停，之后再次点击会从剩余楼层继续。\n\n继续补建吗？',
+    );
+    if (!confirmed) return;
+
+    const chatId = String(context().chatId || '');
+    backfillRuntime.running = true;
+    backfillRuntime.cancelRequested = false;
+    backfillRuntime.chatId = chatId;
+    backfillRuntime.total = indices.length;
+    backfillRuntime.completed = 0;
+    addDiagnosticLog(
+        'capture.backfill.started',
+        '遗漏记忆补建开始',
+        `扫描到 ${indices.length} 个缺失 AI 楼层，将按顺序逐轮处理`,
+        'warning',
+        { 缺失轮数: indices.length, 首个AI楼层: indices[0] + 1 },
+    );
+    runtimeStatus.captureState = 'working';
+    runtimeStatus.captureText = `捕获：正在补建遗漏记忆 · 0/${indices.length}`;
+    showActionFeedback(`开始补建 ${indices.length} 轮遗漏记忆…`, 'working', 0);
+    render();
+
+    let failedIndex = -1;
+    try {
+        for (const index of indices) {
+            if (backfillRuntime.cancelRequested || String(context().chatId || '') !== chatId) break;
+            const captured = await queueProfileCapture(index, {
+                force: false,
+                reason: 'backfill',
+                generationType: 'backfill',
+            });
+            if (!captured) {
+                failedIndex = index;
+                break;
+            }
+            backfillRuntime.completed++;
+            runtimeStatus.captureState = 'working';
+            runtimeStatus.captureText = `捕获：正在补建遗漏记忆 · ${backfillRuntime.completed}/${backfillRuntime.total}`;
+            render();
+            if (backfillRuntime.completed < backfillRuntime.total) await waitForBackfillDelay();
+        }
+
+        const remaining = missingCaptureIndices().length;
+        if (backfillRuntime.cancelRequested || String(context().chatId || '') !== chatId) {
+            runtimeStatus.captureState = 'warning';
+            runtimeStatus.captureText = `捕获：补建已暂停 · 本次完成 ${backfillRuntime.completed} 轮 · 剩余 ${remaining} 轮`;
+            addDiagnosticLog(
+                'capture.backfill.paused',
+                '遗漏记忆补建已暂停',
+                `本次完成 ${backfillRuntime.completed} 轮，剩余 ${remaining} 轮`,
+                'warning',
+            );
+            showActionFeedback(`已暂停；完成 ${backfillRuntime.completed} 轮，剩余 ${remaining} 轮`, 'success', 3000);
+        } else if (failedIndex >= 0) {
+            runtimeStatus.captureState = 'error';
+            runtimeStatus.captureText = `捕获：补建在 AI 楼层 ${failedIndex + 1} 停止 · 剩余 ${remaining} 轮`;
+            addDiagnosticLog(
+                'capture.backfill.failed',
+                '遗漏记忆补建中断',
+                `AI 楼层 ${failedIndex + 1} 未成功，剩余 ${remaining} 轮`,
+                'error',
+            );
+            showActionFeedback(`补建已停止，剩余 ${remaining} 轮；可稍后继续`, 'error', 3400);
+        } else {
+            runtimeStatus.captureState = 'success';
+            runtimeStatus.captureText = `捕获：遗漏记忆补建完成 · 本次补回 ${backfillRuntime.completed} 轮`;
+            addDiagnosticLog(
+                'capture.backfill.completed',
+                '遗漏记忆补建完成',
+                `已按剧情顺序补回 ${backfillRuntime.completed} 轮`,
+                'success',
+            );
+            toastr.success(`遗漏记忆补建完成，共补回 ${backfillRuntime.completed} 轮`);
+            showActionFeedback(`补建完成：${backfillRuntime.completed} 轮`, 'success', 3000);
+        }
+    } finally {
+        backfillRuntime.running = false;
+        backfillRuntime.cancelRequested = false;
+        render();
+    }
+}
+
 function mountUi() {
     if (document.getElementById('ksm-launcher')) return;
     document.body.insertAdjacentHTML('beforeend', `
@@ -3718,6 +3877,9 @@ function mountUi() {
                     <button data-action="retry-last">
                         <i class="fa-solid fa-rotate-right"></i><span>重试本轮</span>
                     </button>
+                    <button data-action="backfill-missing">
+                        <i class="fa-solid fa-clock-rotate-left"></i><span class="ksm-button-label">补建遗漏</span>
+                    </button>
                     <button data-action="bootstrap-facts">
                         <i class="fa-solid fa-wand-magic-sparkles"></i><span class="ksm-button-label">整理细节</span>
                     </button>
@@ -3886,6 +4048,7 @@ function mountUi() {
         if (action === 'restore-default-instruction') restoreDefaultMemoryInstruction();
         if (action === 'test-profile') void testProfileConnection();
         if (action === 'retry-last') void retryLastCapture();
+        if (action === 'backfill-missing') void backfillMissingCaptures();
         if (action === 'bootstrap-facts') void bootstrapFactsFromMemory();
         if (action === 'rebuild' && confirm('将根据当前聊天中保存的记忆标签重建侧栏，继续吗？')) {
             addDiagnosticLog('memory.rebuild.manual', '手动重建开始', '将按当前聊天底片重算侧栏', 'info');

@@ -69,8 +69,8 @@ assert.strictEqual(api.launcherVisible(), true);
 launcher.style.display = 'none';
 assert.strictEqual(api.launcherVisible(), false, 'launcher state must use the real floating button after detach');
 api.patchVersionText();
-assert.strictEqual(panelLeafA.textContent, 'Memory archive · v0.3.20');
-assert.strictEqual(panelLeafB.textContent, '当前 v0.3.20 · 已是最新版本');
+assert.strictEqual(panelLeafA.textContent, 'Memory archive · v0.3.21');
+assert.strictEqual(panelLeafB.textContent, '当前 v0.3.21 · 已是最新版本');
 assert.strictEqual(api.setTextIfChanged(panelLeafA, panelLeafA.textContent), false);
 
-console.log('v0.3.20 UI layout tests passed');
+console.log('v0.3.21 UI layout tests passed');
