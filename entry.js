@@ -1,5 +1,5 @@
 /**
- * Krystal Scroll Memory v0.3.21 compatibility entry.
+ * Krystal Scroll Memory v0.3.22 compatibility entry.
  *
  * Keeps the stable v0.3.14 core while adding:
  * - source-floor-safe memory request rewriting;
@@ -9,7 +9,7 @@
  * - a TT-safe wand menu and launcher toggle.
  */
 
-const COMPAT_VERSION = '0.3.21';
+const COMPAT_VERSION = '0.3.22';
 const CORE_VERSION = '0.3.14';
 const SETTINGS_KEY = 'krystalScrollMemory';
 const MESSAGE_META_KEY = 'krystalScrollMemoryCapture';
@@ -517,7 +517,9 @@ function installCaptureGuards() {
                 armAssistantCaptureInvalidation('user-edit', true);
                 return;
             }
-            persistCaptureInvalidation(index, false);
+            // The core compares the saved semantic digest with the edited text.
+            // Formatting-only assistant edits keep their existing capture;
+            // meaningful story changes invalidate and recapture it there.
         });
     }
 

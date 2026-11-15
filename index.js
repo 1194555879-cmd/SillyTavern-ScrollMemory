@@ -1161,6 +1161,30 @@ function stripMemoryBlocks(text) {
     return clean(String(text || '').replace(MEMORY_BLOCK_RE, ''));
 }
 
+function semanticMessageText(text) {
+    return stripMemoryBlocks(text)
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/```(?:html|css|xml|javascript|js)?/gi, ' ')
+        .replace(/[`*_~]+/g, '')
+        .replace(/[\u200B-\u200D\uFEFF]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function semanticMessageDigest(text) {
+    return hash(semanticMessageText(text));
+}
+
+function messageMatchesCaptureSnapshot(message, snapshot) {
+    if (!message || message.is_user) return false;
+    if (Number(message.swipe_id || 0) !== snapshot.swipeId) return false;
+    return String(message.mes || '') === snapshot.messageText
+        || semanticMessageDigest(message.mes) === snapshot.semanticDigest;
+}
+
 function messageSpeaker(message) {
     const ctx = context();
     if (message.name) return message.name;
@@ -1904,8 +1928,7 @@ async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
     const message = current.chat[messageIndex];
     if (!message || message.is_user) return false;
     if (current.chatId !== snapshot.chatId
-        || String(message.mes || '') !== snapshot.messageText
-        || Number(message.swipe_id || 0) !== snapshot.swipeId) {
+        || !messageMatchesCaptureSnapshot(message, snapshot)) {
         return false;
     }
     detachImportedTerminalMemory();
@@ -1941,9 +1964,7 @@ async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
         const latest = context();
         const latestMessage = latest.chat[messageIndex];
         if (latest.chatId !== snapshot.chatId
-            || !latestMessage
-            || String(latestMessage.mes || '') !== snapshot.messageText
-            || Number(latestMessage.swipe_id || 0) !== snapshot.swipeId) {
+            || !messageMatchesCaptureSnapshot(latestMessage, snapshot)) {
             const canRecaptureCurrentVersion = latest.chatId === snapshot.chatId
                 && latestMessage
                 && !latestMessage.is_user
@@ -2042,7 +2063,7 @@ function profileCaptureKey(chatId, messageIndex, message) {
         String(chatId || ''),
         messageIndex,
         Number(message?.swipe_id || 0),
-        hash(String(message?.mes || '')),
+        semanticMessageDigest(message?.mes),
     ].join('␟');
 }
 
@@ -2056,6 +2077,7 @@ function queueProfileCapture(messageIndex, options = {}) {
     const snapshot = {
         chatId: ctx.chatId,
         messageText: String(message.mes || ''),
+        semanticDigest: semanticMessageDigest(message.mes),
         swipeId: Number(message.swipe_id || 0),
     };
     const key = profileCaptureKey(snapshot.chatId, resolvedIndex, message);
@@ -2068,10 +2090,7 @@ function queueProfileCapture(messageIndex, options = {}) {
             const latest = context();
             const latestMessage = latest.chat[resolvedIndex];
             if (latest.chatId !== snapshot.chatId
-                || !latestMessage
-                || latestMessage.is_user
-                || String(latestMessage.mes || '') !== snapshot.messageText
-                || Number(latestMessage.swipe_id || 0) !== snapshot.swipeId) {
+                || !messageMatchesCaptureSnapshot(latestMessage, snapshot)) {
                 return false;
             }
             if (!force && readStoredCapture(latestMessage)) return false;
@@ -2258,6 +2277,7 @@ function readStoredCapture(message) {
         archiveSourceDigest: String(stored.archiveSourceDigest || ''),
         capturedAt: Number(stored.capturedAt) || 0,
         source: String(stored.source || ''),
+        contentDigest: String(stored.contentDigest || ''),
     };
     return hasCapture(capture) ? capture : null;
 }
@@ -2269,6 +2289,9 @@ function createStoredCapture(capture, source, metadata = {}) {
         facts: normalizeFactOps(capture.facts),
         source,
         capturedAt: Date.now(),
+        ...(metadata.contentDigest
+            ? { contentDigest: String(metadata.contentDigest) }
+            : {}),
         ...(metadata.archiveSourceDigest
             ? { archiveSourceDigest: String(metadata.archiveSourceDigest) }
             : {}),
@@ -2277,7 +2300,10 @@ function createStoredCapture(capture, source, metadata = {}) {
 
 function writeStoredCapture(message, capture, source, metadata = {}) {
     message.extra ??= {};
-    const stored = createStoredCapture(capture, source, metadata);
+    const stored = createStoredCapture(capture, source, {
+        ...metadata,
+        contentDigest: metadata.contentDigest || semanticMessageDigest(message.mes),
+    });
     message.extra[MESSAGE_META_KEY] = stored;
 
     const swipeId = Number(message.swipe_id);
@@ -2294,7 +2320,11 @@ function writeStoredCaptureToSwipe(message, swipeId, capture, source, metadata =
         message.swipe_info[swipeId].extra[MESSAGE_META_KEY] = createStoredCapture(
             capture,
             source,
-            metadata,
+            {
+                ...metadata,
+                contentDigest: metadata.contentDigest
+                    || semanticMessageDigest(message.swipes?.[swipeId] || message.mes),
+            },
         );
     }
     return true;
@@ -2310,6 +2340,30 @@ function syncCaptureFromCurrentSwipe(message) {
     } else {
         delete message.extra[MESSAGE_META_KEY];
     }
+}
+
+function migrateStoredCaptureDigests() {
+    const ctx = context();
+    let changed = false;
+    for (const message of ctx.chat) {
+        if (!message || message.is_user) continue;
+        const stored = message.extra?.[MESSAGE_META_KEY];
+        if (stored && typeof stored === 'object' && !stored.contentDigest) {
+            stored.contentDigest = semanticMessageDigest(message.mes);
+            changed = true;
+        }
+        if (!Array.isArray(message.swipe_info)) continue;
+        for (let swipeId = 0; swipeId < message.swipe_info.length; swipeId++) {
+            const swipeStored = message.swipe_info[swipeId]?.extra?.[MESSAGE_META_KEY];
+            if (!swipeStored || typeof swipeStored !== 'object' || swipeStored.contentDigest) continue;
+            swipeStored.contentDigest = semanticMessageDigest(
+                message.swipes?.[swipeId] ?? (swipeId === Number(message.swipe_id) ? message.mes : ''),
+            );
+            changed = true;
+        }
+    }
+    if (changed) void Promise.resolve(ctx.saveChat?.()).catch(() => null);
+    return changed;
 }
 
 function messageForSwipe(message, swipeId) {
@@ -2671,6 +2725,7 @@ function rebuildFromChat() {
 function refreshCurrentChatState({ showStatus = false } = {}) {
     const ctx = context();
     if (!ctx.chatId) return null;
+    migrateStoredCaptureDigests();
     const before = state();
     const beforeShort = before.short.length;
     const detached = detachImportedTerminalMemory();
@@ -4295,28 +4350,52 @@ function registerEvents() {
     if (events.MESSAGE_EDITED) {
         ctx.eventSource.on(events.MESSAGE_EDITED, messageIndex => {
             const numericIndex = Number(messageIndex);
+            const message = context().chat[numericIndex];
+            const stored = message && !message.is_user ? readStoredCapture(message) : null;
+            const formattingOnly = Boolean(
+                stored?.contentDigest
+                && stored.contentDigest === semanticMessageDigest(message.mes),
+            );
             addDiagnosticLog(
                 'chat.message.edited',
                 '聊天内容已编辑',
-                `楼层 ${numericIndex + 1} 的旧底片将失效`,
-                'warning',
+                formattingOnly
+                    ? `楼层 ${numericIndex + 1} 仅有格式或代码结构变化，保留原记忆`
+                    : `楼层 ${numericIndex + 1} 的剧情正文发生变化，旧底片将失效`,
+                formattingOnly ? 'success' : 'warning',
             );
             const detached = detachImportedTerminalMemory();
             if (detached.detached) rebuildFromChat();
-            const message = context().chat[numericIndex];
+            if (formattingOnly) {
+                rebuildFromChat();
+                window.setTimeout(hideAllMemoryBlocks, 50);
+                runtimeStatus.captureState = 'success';
+                runtimeStatus.captureText = '捕获：检测到仅修改格式或代码结构，已保留原总结';
+                render();
+                return;
+            }
             if (message && !message.is_user) clearStoredCapture(message);
             rebuildFromChat();
             window.setTimeout(hideAllMemoryBlocks, 50);
             if (isDedicatedMode() && message && !message.is_user && String(message.mes || '').trim()) {
+                const pendingEquivalent = pendingProfileCaptures.has(
+                    profileCaptureKey(context().chatId, numericIndex, message),
+                );
                 runtimeStatus.captureState = 'working';
-                runtimeStatus.captureText = '捕获：聊天已编辑，等待内容稳定后自动重新总结';
+                runtimeStatus.captureText = pendingEquivalent
+                    ? '捕获：仅修改格式，等待当前总结完成'
+                    : '捕获：剧情正文已修改，等待内容稳定后自动重新总结';
                 addDiagnosticLog(
                     'capture.edit.rescheduled',
-                    '已安排编辑后自动补记',
-                    `AI 楼层 ${numericIndex + 1} · 将使用保存后的最终内容`,
+                    pendingEquivalent ? '沿用当前总结请求' : '已安排正文修改后自动补记',
+                    pendingEquivalent
+                        ? `AI 楼层 ${numericIndex + 1} · 格式变化不重复调用 API`
+                        : `AI 楼层 ${numericIndex + 1} · 将使用保存后的最终正文`,
                     'info',
                 );
-                scheduleProfileCapture(numericIndex, 'edit', EDIT_RECAPTURE_DELAY);
+                if (!pendingEquivalent) {
+                    scheduleProfileCapture(numericIndex, 'edit', EDIT_RECAPTURE_DELAY);
+                }
             } else {
                 runtimeStatus.captureState = 'idle';
                 runtimeStatus.captureText = isDedicatedMode()
