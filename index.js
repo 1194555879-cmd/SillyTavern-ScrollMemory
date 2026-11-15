@@ -28,6 +28,7 @@ const MAX_FACT_CONTENT_LENGTH = 500;
 const DEFAULT_MAX_TOKENS = 900;
 const MIN_MAX_TOKENS = 200;
 const MAX_MAX_TOKENS = 4000;
+const EDIT_RECAPTURE_DELAY = 1000;
 const LAUNCHER_MARGIN = 8;
 const LAUNCHER_DRAG_THRESHOLD = 6;
 const SHORT_RE = /【记忆条目】([\s\S]{1,1200}?)【记忆完】/g;
@@ -1932,15 +1933,26 @@ async function captureMessageWithProfile(messageIndex, snapshot, options = {}) {
             || !latestMessage
             || String(latestMessage.mes || '') !== snapshot.messageText
             || Number(latestMessage.swipe_id || 0) !== snapshot.swipeId) {
-            runtimeStatus.captureState = 'warning';
-            runtimeStatus.captureText = '捕获：对话或重说已变化，本次结果已丢弃';
+            const canRecaptureCurrentVersion = latest.chatId === snapshot.chatId
+                && latestMessage
+                && !latestMessage.is_user
+                && String(latestMessage.mes || '').trim();
+            runtimeStatus.captureState = canRecaptureCurrentVersion ? 'working' : 'warning';
+            runtimeStatus.captureText = canRecaptureCurrentVersion
+                ? '捕获：内容已变化，旧结果已丢弃；正在自动补记最终版本'
+                : '捕获：对话或重说已变化，本次结果已丢弃';
             addDiagnosticLog(
                 'capture.discarded',
                 '总结结果已丢弃',
-                '请求期间聊天内容或当前 swipe 发生变化',
+                canRecaptureCurrentVersion
+                    ? '请求期间内容发生变化，已自动排队补记当前最终版本'
+                    : '请求期间聊天内容或当前 swipe 发生变化',
                 'warning',
                 { AI楼层: messageIndex + 1, 原swipe: snapshot.swipeId },
             );
+            if (canRecaptureCurrentVersion) {
+                scheduleProfileCapture(messageIndex, 'content-change', EDIT_RECAPTURE_DELAY);
+            }
             render();
             return false;
         }
@@ -2079,7 +2091,15 @@ function scheduleProfileCapture(messageIndex, generationType = 'normal', delay =
         const resolvedIndex = resolveAssistantMessageIndex(messageIndex);
         const message = context().chat[resolvedIndex];
         if (!message || message.is_user || !String(message.mes || '').trim()) return;
-        const force = ['swipe', 'regenerate', 'continue', 'append', 'appendFinal']
+        const force = [
+            'swipe',
+            'regenerate',
+            'continue',
+            'append',
+            'appendFinal',
+            'edit',
+            'content-change',
+        ]
             .includes(String(generationType));
         hideMemoryInMessage(resolvedIndex);
         addDiagnosticLog(
@@ -4106,22 +4126,36 @@ function registerEvents() {
     }
     if (events.MESSAGE_EDITED) {
         ctx.eventSource.on(events.MESSAGE_EDITED, messageIndex => {
+            const numericIndex = Number(messageIndex);
             addDiagnosticLog(
                 'chat.message.edited',
                 '聊天内容已编辑',
-                `楼层 ${Number(messageIndex) + 1} 的旧底片将失效`,
+                `楼层 ${numericIndex + 1} 的旧底片将失效`,
                 'warning',
             );
             const detached = detachImportedTerminalMemory();
             if (detached.detached) rebuildFromChat();
-            const message = context().chat[Number(messageIndex)];
+            const message = context().chat[numericIndex];
             if (message && !message.is_user) clearStoredCapture(message);
-            runtimeStatus.captureState = 'idle';
-            runtimeStatus.captureText = isDedicatedMode()
-                ? '捕获：聊天已编辑；如需更新记忆，请点“重试本轮”'
-                : '捕获：聊天已编辑，已按当前内容重建';
             rebuildFromChat();
             window.setTimeout(hideAllMemoryBlocks, 50);
+            if (isDedicatedMode() && message && !message.is_user && String(message.mes || '').trim()) {
+                runtimeStatus.captureState = 'working';
+                runtimeStatus.captureText = '捕获：聊天已编辑，等待内容稳定后自动重新总结';
+                addDiagnosticLog(
+                    'capture.edit.rescheduled',
+                    '已安排编辑后自动补记',
+                    `AI 楼层 ${numericIndex + 1} · 将使用保存后的最终内容`,
+                    'info',
+                );
+                scheduleProfileCapture(numericIndex, 'edit', EDIT_RECAPTURE_DELAY);
+            } else {
+                runtimeStatus.captureState = 'idle';
+                runtimeStatus.captureText = isDedicatedMode()
+                    ? '捕获：用户消息已编辑，已清理受影响的旧记忆'
+                    : '捕获：聊天已编辑，已按当前内容重建';
+            }
+            render();
         });
     }
     if (events.MORE_MESSAGES_LOADED) {

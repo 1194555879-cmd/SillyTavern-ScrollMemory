@@ -1,10 +1,10 @@
 /**
- * Krystal Scroll Memory v0.3.19 UI layout adapter.
+ * Krystal Scroll Memory v0.3.20 UI layout adapter.
  * Keeps the wand menu as one entry and moves secondary actions into the panel.
  */
 
-const COMPAT_VERSION = '0.3.19';
-const PREVIOUS_VERSIONS = ['0.3.17', '0.3.18'];
+const COMPAT_VERSION = '0.3.20';
+const PREVIOUS_VERSIONS = ['0.3.17', '0.3.18', '0.3.19'];
 const PANEL_ACTIONS_ID = 'ksm-panel-quick-actions';
 const WAND_ITEM_IDS = {
     ignore: 'ksm-wand-ignore-last',
