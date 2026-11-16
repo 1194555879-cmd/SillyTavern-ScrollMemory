@@ -3570,14 +3570,16 @@ async function retryLastCapture() {
     }
 }
 
-function missingCaptureIndices() {
+function captureAudit() {
     const ctx = context();
     const currentState = state();
     const baseline = normalizeBaseline(currentState?.baseline);
     const boundary = baseline
         ? resolveBaselineBoundary(baseline, ctx.chat, ctx.chat.length)
         : { startIndex: 0 };
-    const missing = [];
+    const candidateIndices = [];
+    const capturedIndices = [];
+    const missingIndices = [];
     let hasUserTurn = false;
     for (let index = 0; index < ctx.chat.length; index++) {
         const message = ctx.chat[index];
@@ -3589,13 +3591,60 @@ function missingCaptureIndices() {
         if (index < boundary.startIndex
             || message.is_system
             || !hasUserTurn
-            || !String(message.mes || '').trim()
-            || readStoredCapture(message)) {
+            || !String(message.mes || '').trim()) {
             continue;
         }
-        missing.push(index);
+        candidateIndices.push(index);
+        if (readStoredCapture(message)) capturedIndices.push(index);
+        else missingIndices.push(index);
     }
-    return missing;
+    return {
+        candidateIndices,
+        capturedIndices,
+        missingIndices,
+        baselineStatus: boundary.status || 'none',
+    };
+}
+
+function missingCaptureIndices() {
+    return captureAudit().missingIndices;
+}
+
+function nextArchiveRepairIndex() {
+    const ctx = context();
+    for (let index = 0; index < ctx.chat.length; index++) {
+        const message = ctx.chat[index];
+        if (!message || message.is_user || message.is_system || !readStoredCapture(message)) continue;
+        const before = buildStateFromChat(index);
+        if (before.short.length < MAX_SHORT) continue;
+        const stored = readStoredCapture(message);
+        const expectedDigest = archiveSourceDigest(before.short.slice(0, MAX_SHORT));
+        if (stored.long.length && stored.archiveSourceDigest === expectedDigest) continue;
+        return index;
+    }
+    return -1;
+}
+
+async function repairArchiveBoundaries(chatId) {
+    const maxRepairs = Math.ceil(context().chat.length / MAX_SHORT) + 2;
+    let repaired = 0;
+    while (repaired < maxRepairs) {
+        if (backfillRuntime.cancelRequested || String(context().chatId || '') !== chatId) break;
+        const index = nextArchiveRepairIndex();
+        if (index < 0) break;
+        runtimeStatus.captureState = 'working';
+        runtimeStatus.captureText = `捕获：正在校正长期归档边界 · 第 ${repaired + 1} 卷`;
+        render();
+        const captured = await queueProfileCapture(index, {
+            force: true,
+            reason: 'repair',
+            generationType: 'archive-repair',
+        });
+        if (!captured) return { repaired, failedIndex: index };
+        repaired++;
+        await waitForBackfillDelay();
+    }
+    return { repaired, failedIndex: -1 };
 }
 
 function waitForBackfillDelay() {
@@ -3615,15 +3664,21 @@ async function backfillMissingCaptures() {
         showActionFeedback('当前模式不支持批量补建', 'error', 2600);
         return;
     }
-    const indices = missingCaptureIndices();
-    if (!indices.length) {
-        toastr.success('已扫描全部聊天，没有发现遗漏楼层');
-        showActionFeedback('没有发现遗漏楼层');
+    const initialAudit = captureAudit();
+    const indices = initialAudit.missingIndices;
+    const archiveRepairNeeded = nextArchiveRepairIndex() >= 0;
+    if (!indices.length && !archiveRepairNeeded) {
+        const message = `已扫描 ${initialAudit.candidateIndices.length} 个 AI 轮次，没有发现遗漏，归档边界也正常`;
+        toastr.success(message);
+        showActionFeedback(message, 'success', 3000);
         return;
     }
+    const scanSummary = `共扫描 ${initialAudit.candidateIndices.length} 个 AI 轮次：已有 ${initialAudit.capturedIndices.length} 个，遗漏 ${indices.length} 个。`;
+    const workSummary = indices.length
+        ? '将从最早遗漏处按剧情顺序逐轮补建，并在最后校正长期归档边界。每个遗漏楼层会调用一次记忆 API，归档校正也可能追加少量请求。'
+        : '没有发现遗漏楼层，但检测到短期记忆超出 20 条，需要调用记忆 API 校正长期归档边界。';
     const confirmed = window.confirm(
-        `扫描到 ${indices.length} 个没有记忆底片的 AI 楼层。\n\n`
-        + '将从最早遗漏处按剧情顺序逐轮补建，每轮会调用一次记忆 API，可能产生费用；可随时暂停，之后再次点击会从剩余楼层继续。\n\n继续补建吗？',
+        `${scanSummary}\n\n${workSummary}\n\n可随时暂停，之后再次点击会继续。是否开始？`,
     );
     if (!confirmed) return;
 
@@ -3636,13 +3691,24 @@ async function backfillMissingCaptures() {
     addDiagnosticLog(
         'capture.backfill.started',
         '遗漏记忆补建开始',
-        `扫描到 ${indices.length} 个缺失 AI 楼层，将按顺序逐轮处理`,
+        `${scanSummary}${archiveRepairNeeded ? ' 检测到归档边界需要校正。' : ''}`,
         'warning',
-        { 缺失轮数: indices.length, 首个AI楼层: indices[0] + 1 },
+        {
+            扫描AI轮数: initialAudit.candidateIndices.length,
+            已有底片: initialAudit.capturedIndices.length,
+            缺失轮数: indices.length,
+            首个缺失AI楼层: indices.length ? indices[0] + 1 : '无',
+        },
     );
     runtimeStatus.captureState = 'working';
-    runtimeStatus.captureText = `捕获：正在补建遗漏记忆 · 0/${indices.length}`;
-    showActionFeedback(`开始补建 ${indices.length} 轮遗漏记忆…`, 'working', 0);
+    runtimeStatus.captureText = indices.length
+        ? `捕获：正在补建遗漏记忆 · 0/${indices.length}`
+        : '捕获：正在校正长期归档边界';
+    showActionFeedback(
+        indices.length ? `开始补建 ${indices.length} 轮遗漏记忆…` : '开始校正长期归档…',
+        'working',
+        0,
+    );
     render();
 
     let failedIndex = -1;
@@ -3665,7 +3731,15 @@ async function backfillMissingCaptures() {
             if (backfillRuntime.completed < backfillRuntime.total) await waitForBackfillDelay();
         }
 
-        const remaining = missingCaptureIndices().length;
+        let archiveRepair = { repaired: 0, failedIndex: -1 };
+        if (!backfillRuntime.cancelRequested
+            && String(context().chatId || '') === chatId
+            && failedIndex < 0) {
+            archiveRepair = await repairArchiveBoundaries(chatId);
+            if (archiveRepair.failedIndex >= 0) failedIndex = archiveRepair.failedIndex;
+        }
+        const finalAudit = captureAudit();
+        const remaining = finalAudit.missingIndices.length;
         if (backfillRuntime.cancelRequested || String(context().chatId || '') !== chatId) {
             runtimeStatus.captureState = 'warning';
             runtimeStatus.captureText = `捕获：补建已暂停 · 本次完成 ${backfillRuntime.completed} 轮 · 剩余 ${remaining} 轮`;
@@ -3688,15 +3762,24 @@ async function backfillMissingCaptures() {
             showActionFeedback(`补建已停止，剩余 ${remaining} 轮；可稍后继续`, 'error', 3400);
         } else {
             runtimeStatus.captureState = 'success';
-            runtimeStatus.captureText = `捕获：遗漏记忆补建完成 · 本次补回 ${backfillRuntime.completed} 轮`;
+            runtimeStatus.captureText = `捕获：补建核对完成 · 扫描 ${finalAudit.candidateIndices.length} 轮 · 补回 ${backfillRuntime.completed} 轮 · 校正归档 ${archiveRepair.repaired} 卷 · 当前短期 ${state().short.length}/${MAX_SHORT}`;
             addDiagnosticLog(
                 'capture.backfill.completed',
-                '遗漏记忆补建完成',
-                `已按剧情顺序补回 ${backfillRuntime.completed} 轮`,
+                '遗漏记忆补建与归档核对完成',
+                `扫描 ${finalAudit.candidateIndices.length} 个 AI 轮次；原有 ${initialAudit.capturedIndices.length} 个；补回 ${backfillRuntime.completed} 个；校正长期归档 ${archiveRepair.repaired} 卷；剩余遗漏 ${remaining} 个`,
                 'success',
+                {
+                    扫描AI轮数: finalAudit.candidateIndices.length,
+                    本次补回: backfillRuntime.completed,
+                    校正归档: archiveRepair.repaired,
+                    剩余遗漏: remaining,
+                    当前短期: `${state().short.length}/${MAX_SHORT}`,
+                    当前长期: `${state().long.length}/${MAX_LONG}`,
+                },
             );
-            toastr.success(`遗漏记忆补建完成，共补回 ${backfillRuntime.completed} 轮`);
-            showActionFeedback(`补建完成：${backfillRuntime.completed} 轮`, 'success', 3000);
+            const message = `核对完成：扫描 ${finalAudit.candidateIndices.length} 轮，补回 ${backfillRuntime.completed} 轮，归档 ${archiveRepair.repaired} 卷`;
+            toastr.success(message);
+            showActionFeedback(message, 'success', 3600);
         }
     } finally {
         backfillRuntime.running = false;
